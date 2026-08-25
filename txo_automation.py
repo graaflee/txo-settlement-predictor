@@ -16,12 +16,43 @@ import csv
 import io
 import re
 import time
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib import request, parse
 
 PROJECT_DIR = Path(__file__).resolve().parent
 HISTORY_FILE = PROJECT_DIR / "backtest_history.json"
+EMAIL_CONFIG_FILE = PROJECT_DIR / "email_config.json"  # 不進 git（見 .gitignore），裡面存 Gmail 應用程式密碼
+
+
+def send_email(subject, body):
+    """用 Gmail SMTP 寄一封通知信給自己，讓手機上的 Gmail app 推播出來。
+    設定檔不存在或內容不完整時，只印出警告、不讓整支腳本因為寄信失敗而中斷。"""
+    if not EMAIL_CONFIG_FILE.exists():
+        print(f"（找不到 {EMAIL_CONFIG_FILE.name}，略過寄信。請照說明建立這個檔案。）")
+        return
+    try:
+        cfg = json.loads(EMAIL_CONFIG_FILE.read_text(encoding="utf-8"))
+        from_email, app_password, to_email = cfg["from_email"], cfg["app_password"], cfg["to_email"]
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"（{EMAIL_CONFIG_FILE.name} 格式不對，略過寄信：{e}）")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+            server.login(from_email, app_password)
+            server.send_message(msg)
+        print("（已寄出通知信）")
+    except Exception as e:
+        print(f"（寄信失敗，不影響回測紀錄本身：{e}）")
 
 
 def fmt_or_dash(v):
@@ -368,6 +399,7 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 權重依據：{weights['source']}
 """
     print(msg)
+    send_email(f"【TXO早盤播報】{contract} 結算日", msg)
 
     # 把這次的預測值暫存起來，收盤後 closing_report() 會讀取、補上實際結算價
     pending = {
@@ -451,6 +483,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 （{new_weights['source']}）
 """
     print(msg)
+    send_email(f"【TXO盤後播報】{contract} 結算 {settle_price:.0f}", msg)
     pending_file.unlink()
 
 
