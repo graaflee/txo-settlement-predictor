@@ -388,13 +388,22 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 
 
 # ============================================================
-# Step 5：盤後結算播報（含重試）
+# Step 5：盤後結算播報
 # ============================================================
+# 重試策略：不在單一次執行裡用 time.sleep() 卡著等（雲端排程 session 一次執行時間有限，
+# 不適合裡面睡 1-2 小時），改成排程本身在收盤後那個時段設定多個觸發時間點（例如
+# 15:00 / 16:00 / 17:00），每次執行只試一次；已經記錄過的話會自動跳過，不會重複入帳。
 
-def closing_report(max_retries=8, retry_interval_sec=900):
+def closing_report(max_retries=1, retry_interval_sec=0):
     pending_file = PROJECT_DIR / "pending_prediction.json"
     if not pending_file.exists():
-        print("找不到今天的早盤預測紀錄（pending_prediction.json），無法產生盤後播報。請確認早盤播報有先執行過。")
+        # 可能是同一天稍早已經成功執行過（pending 用完會被刪除），檢查歷史檔避免誤判成失敗
+        history = load_history()
+        today_str = datetime.now().strftime("%Y/%m/%d")
+        if any(r["date"] == today_str and r.get("actual") is not None for r in history):
+            print(f"今天（{today_str}）的盤後結算已經記錄過了，不用重複執行。")
+        else:
+            print("找不到今天的早盤預測紀錄（pending_prediction.json），無法產生盤後播報。請確認早盤播報有先執行過、且有 commit/push 回 repo。")
         return
 
     pending = json.loads(pending_file.read_text(encoding="utf-8"))
@@ -411,7 +420,7 @@ def closing_report(max_retries=8, retry_interval_sec=900):
             time.sleep(retry_interval_sec)
 
     if settle_price is None:
-        print(f"今天結算價尚未公布（已重試 {max_retries} 次），明天會補上。契約：{contract}")
+        print(f"今天（{contract}）的結算價目前還查不到，稍後排程會再試一次。如果到收盤後好幾個小時都還是這樣，可能要手動上台期所官網確認。")
         return
 
     pred = pending["pred"]
