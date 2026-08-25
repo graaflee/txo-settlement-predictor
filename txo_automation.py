@@ -1,0 +1,456 @@
+"""
+TXO 結算價自動化核心腳本
+
+用法：
+    python txo_automation.py morning   # 結算日 8:00 早盤播報
+    python txo_automation.py closing   # 結算日收盤後結算播報（含重試）
+
+資料來源說明見同資料夾的「資料擷取方式.md」。
+5 種預測方法（Max Pain / PCP隱含 / OI重心 / 成交量加權 / 歷史偏誤修正）與加權邏輯，
+對應 HTML 裡的 analyzeContract() / computeWeights() / computeEnsemble() / computeHistoricalBias()。
+"""
+
+import sys
+import json
+import csv
+import io
+import re
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib import request, parse
+
+PROJECT_DIR = Path(__file__).resolve().parent
+HISTORY_FILE = PROJECT_DIR / "backtest_history.json"
+
+
+def fmt_or_dash(v):
+    """None 顯示成「—」，數字四捨五入成整數字串，讓播報訊息裡不會冒出 Python 的 None 字樣。"""
+    return "—" if v is None else f"{v:.0f}"
+
+
+def js_round(x):
+    """比照 JS 的 Math.round()：永遠四捨五入（round half up），跟 Python 內建 round() 的
+    banker's rounding（round half to even）不同，避免兩邊算出差 1 點的數字。"""
+    import math
+    return math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)
+
+OPT_DATA_URL = "https://www.taifex.com.tw/cht/3/optDataDown"
+SETTLE_PRICE_URL = "https://www.taifex.com.tw/cht/5/optIndxFSP"  # 選擇權專用結算價頁面（不是期貨的 futIndxFSP，那個沒有週五 F 系列契約）
+HEADERS = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"}
+
+
+# ============================================================
+# 資料下載與解析
+# ============================================================
+
+def http_post(url, fields):
+    data = parse.urlencode(fields).encode("utf-8")
+    req = request.Request(url, data=data, headers=HEADERS, method="POST")
+    with request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    return raw
+
+
+def fetch_txo_csv(date_str):
+    """下載指定日期(YYYY/MM/DD)的 TXO 選擇權盤後 CSV，回傳 {契約: {calls:{}, puts:{}, expiry: str}}。
+    若當天沒有交易資料（假日、尚未公布），回傳 None。"""
+    raw = http_post(OPT_DATA_URL, {
+        "down_type": "1",
+        "commodity_id": "TXO",
+        "commodity_id2": "",
+        "queryStartDate": date_str,
+        "queryEndDate": date_str,
+    })
+    text = raw.decode("big5", errors="ignore")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if len(rows) < 2:
+        return None
+
+    header = rows[0]
+    idx = {name: header.index(name) for name in
+           ["契約", "到期月份(週別)", "履約價", "買賣權", "成交量", "結算價",
+            "未沖銷契約數", "交易時段", "契約到期日", "開盤價", "最高價", "最低價", "收盤價"]
+           if name in header}
+
+    def to_num(v):
+        v = v.strip()
+        if v in ("", "-"):
+            return None
+        try:
+            n = float(v)
+            return None if n < 0 else n
+        except ValueError:
+            return None
+
+    result = {}
+    for row in rows[1:]:
+        if len(row) < 10:
+            continue
+        if row[idx["交易時段"]].strip() != "一般":
+            continue
+        contract = row[idx["到期月份(週別)"]].strip()
+        if not contract:
+            continue
+        if contract not in result:
+            result[contract] = {"calls": {}, "puts": {}, "expiry": row[idx["契約到期日"]].strip()}
+        try:
+            strike = int(float(row[idx["履約價"]]))
+        except ValueError:
+            continue
+        entry = {
+            "v": to_num(row[idx["成交量"]]) or 0,
+            "oi": to_num(row[idx["未沖銷契約數"]]) or 0,
+            "s": to_num(row[idx["結算價"]]),
+        }
+        opt_type = row[idx["買賣權"]].strip()
+        if opt_type == "買權":
+            result[contract]["calls"][strike] = entry
+        elif opt_type == "賣權":
+            result[contract]["puts"][strike] = entry
+    return result if result else None
+
+
+def fetch_night_session_implied(date_str):
+    """抓同一份 CSV 裡'盤後'(夜盤)列的資料，用跟日盤 PCP 隱含價一樣的公式（履約價 + 買權收盤 - 賣權收盤，
+    取平均），算出夜盤的隱含現貨價，回傳 {契約: 夜盤隱含價}，供早盤播報跟日盤 PCP 隱含價比較當隔夜方向參考。
+    夜盤沒有未沖銷契約數，所以不能算 Max Pain / OI重心，只能算這個。單一選擇權的原始收盤價本身沒有參考意義，
+    不直接使用。"""
+    raw = http_post(OPT_DATA_URL, {
+        "down_type": "1",
+        "commodity_id": "TXO",
+        "commodity_id2": "",
+        "queryStartDate": date_str,
+        "queryEndDate": date_str,
+    })
+    text = raw.decode("big5", errors="ignore")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if len(rows) < 2:
+        return {}
+    header = rows[0]
+    idx = {name: header.index(name) for name in
+           ["到期月份(週別)", "履約價", "買賣權", "收盤價", "交易時段"] if name in header}
+
+    by_contract = {}
+    for row in rows[1:]:
+        if len(row) < 10 or row[idx["交易時段"]].strip() != "盤後":
+            continue
+        contract = row[idx["到期月份(週別)"]].strip()
+        close = row[idx["收盤價"]].strip()
+        if close in ("", "-"):
+            continue
+        try:
+            strike = int(float(row[idx["履約價"]]))
+            price = float(close)
+        except ValueError:
+            continue
+        opt_type = row[idx["買賣權"]].strip()
+        by_contract.setdefault(contract, {"calls": {}, "puts": {}})
+        if opt_type == "買權":
+            by_contract[contract]["calls"][strike] = price
+        elif opt_type == "賣權":
+            by_contract[contract]["puts"][strike] = price
+
+    result = {}
+    for contract, sides in by_contract.items():
+        implied = [k + sides["calls"][k] - sides["puts"][k]
+                   for k in sides["calls"] if k in sides["puts"]]
+        if implied:
+            result[contract] = js_round(sum(implied) / len(implied))
+    return result
+
+
+def fetch_settlement_prices(year, month):
+    """查詢台期所「臺指選擇權（TXO）最後結算價」表，回傳 {契約: 最後結算價}。
+    這個表同時涵蓋週三(W系列)、週五(F系列，2025-06-27上市)、月選共 3 種結算契約，
+    不能用期貨的 futIndxFSP 頁面（那個只涵蓋 TX 期貨傳統的週三/月結算，沒有週五選擇權）。"""
+    raw = http_post(SETTLE_PRICE_URL, {
+        "start_year": str(year),
+        "start_month": f"{month:02d}",
+        "end_year": str(year),
+        "end_month": f"{month:02d}",
+        "commodityIds": "2",
+    })
+    text = raw.decode("big5", errors="ignore")
+    rows = re.findall(
+        r'<TD[^>]*align=middle>(\d{4}/\d{2}/\d{2})</TD>\s*<TD[^>]*align=middle>\s*([\w]+)\s*</TD>\s*<TD[^>]*align=right>([\d.]+)</TD>',
+        text,
+    )
+    return {contract.strip(): float(price) for _date, contract, price in rows}
+
+
+# ============================================================
+# 5 種方法計算（對應 HTML 的 analyzeContract）
+# ============================================================
+
+def analyze_contract(data):
+    calls, puts = data["calls"], data["puts"]
+    all_strikes = sorted(set(calls) | set(puts))
+    if not all_strikes:
+        return None
+
+    # 1) Max Pain
+    pain = []
+    for ts in all_strikes:
+        total = 0
+        for k in all_strikes:
+            coi = calls.get(k, {}).get("oi", 0)
+            poi = puts.get(k, {}).get("oi", 0)
+            if ts > k:
+                total += (ts - k) * coi
+            if ts < k:
+                total += (k - ts) * poi
+        pain.append((ts, total))
+    min_pain = min(p for _, p in pain)
+    max_pain_strike = next(ts for ts, p in pain if p == min_pain)
+
+    # 2) PCP implied price
+    implied = []
+    for k in all_strikes:
+        cs, ps = calls.get(k, {}).get("s"), puts.get(k, {}).get("s")
+        if cs and ps and cs > 0 and ps > 0:
+            implied.append(k + cs - ps)
+    implied_price = js_round(sum(implied) / len(implied)) if implied else None
+
+    # 3) OI-weighted center
+    call_oi_sum = sum(calls.get(k, {}).get("oi", 0) for k in all_strikes)
+    put_oi_sum = sum(puts.get(k, {}).get("oi", 0) for k in all_strikes)
+    call_center = js_round(sum(k * calls.get(k, {}).get("oi", 0) for k in all_strikes) / call_oi_sum) if call_oi_sum else None
+    put_center = js_round(sum(k * puts.get(k, {}).get("oi", 0) for k in all_strikes) / put_oi_sum) if put_oi_sum else None
+    oi_center = js_round((call_center + put_center) / 2) if call_center and put_center else None
+
+    # 3b) Volume-weighted center
+    call_v_sum = sum(calls.get(k, {}).get("v", 0) for k in all_strikes)
+    put_v_sum = sum(puts.get(k, {}).get("v", 0) for k in all_strikes)
+    call_vcenter = js_round(sum(k * calls.get(k, {}).get("v", 0) for k in all_strikes) / call_v_sum) if call_v_sum else None
+    put_vcenter = js_round(sum(k * puts.get(k, {}).get("v", 0) for k in all_strikes) / put_v_sum) if put_v_sum else None
+    vol_center = js_round((call_vcenter + put_vcenter) / 2) if call_vcenter and put_vcenter else None
+
+    return {
+        "maxPainStrike": max_pain_strike,
+        "impliedPrice": implied_price,
+        "oiCenter": oi_center,
+        "volCenter": vol_center,
+        "expiry": data["expiry"],
+    }
+
+
+def compute_historical_bias(history, max_pain_strike, n=10):
+    if max_pain_strike is None:
+        return None
+    done = [r for r in history if r.get("actual") is not None and r.get("pred", {}).get("mp") is not None][-n:]
+    if len(done) < 2:
+        return None
+    avg_bias = sum(r["actual"] - r["pred"]["mp"] for r in done) / len(done)
+    return js_round(max_pain_strike + avg_bias)
+
+
+def compute_weights(history, n=10):
+    done = [r for r in history if r.get("actual") is not None][-n:]
+    if len(done) < 2:
+        return {"w1": .2, "w2": .2, "w3": .2, "w4": .2, "w5": .2, "source": "equal"}
+
+    keys = ["mp", "pcp", "oi", "vw", "hb"]
+    mae = []
+    for key in keys:
+        errs = [abs((r["pred"].get(key) if r["pred"].get(key) is not None else r["actual"]) - r["actual"]) for r in done]
+        mae.append(sum(errs) / len(errs))
+
+    eps = 1
+    inv = [1 / (m + eps) for m in mae]
+    inv_sum = sum(inv)
+    weights = {f"w{i+1}": inv[i] / inv_sum for i in range(5)}
+    weights["source"] = f"基於近 {len(done)} 筆回測"
+    return weights
+
+
+def compute_ensemble(mp, pcp, oi, vw, hb, weights):
+    inputs = [mp, pcp, oi, vw, hb]
+    ws = [weights["w1"], weights["w2"], weights["w3"], weights["w4"], weights["w5"]]
+    total, wsum = 0, 0
+    for val, w in zip(inputs, ws):
+        if val is not None:
+            total += val * w
+            wsum += w
+    return js_round(total / wsum) if wsum > 0 else None
+
+
+# ============================================================
+# 歷史檔讀寫
+# ============================================================
+
+def load_history():
+    if HISTORY_FILE.exists():
+        return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    return []
+
+
+def save_history(history):
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ============================================================
+# 判斷今天是否為結算日、要結算哪個契約
+# ============================================================
+
+def find_todays_settling_contract(csv_data, today):
+    """在 csv_data（{契約: {...expiry}}）裡找契約到期日等於今天的契約。"""
+    today_str = today.strftime("%Y%m%d")
+    for contract, data in csv_data.items():
+        if data["expiry"] == today_str:
+            return contract
+    return None
+
+
+def fetch_latest_csv(start_date, max_back_days=5):
+    """從 start_date 開始往前找最近一份有資料的 CSV（跳過假日/尚未公布的日子）。"""
+    d = start_date
+    for _ in range(max_back_days):
+        date_str = d.strftime("%Y/%m/%d")
+        data = fetch_txo_csv(date_str)
+        if data:
+            return date_str, data
+        d -= timedelta(days=1)
+    return None, None
+
+
+# ============================================================
+# Step 4：8:00 早盤播報
+# ============================================================
+
+def morning_report():
+    today = datetime.now()
+    # TXO 週選結算日：週三(W系列，含月選) 或 週五(F系列，2025-06-27上市)。0=Mon ... 2=Wed, 4=Fri
+    if today.weekday() not in (2, 4):
+        print("今天不是週三或週五，非 TXO 結算日，不執行早盤播報。")
+        return
+
+    # 用前一交易日的盤後 CSV 找出今天要結算的契約
+    yesterday = today - timedelta(days=1)
+    date_str, data = fetch_latest_csv(yesterday)
+    if not data:
+        print("找不到最近的盤後 CSV，無法產生早盤播報。")
+        return
+
+    contract = find_todays_settling_contract(data, today)
+    if not contract:
+        print(f"{date_str} 的 CSV 裡找不到今天到期的契約，可能今天不是實際交易日或資料尚未涵蓋新契約，略過播報。")
+        return
+
+    analysis = analyze_contract(data[contract])
+    history = load_history()
+    weights = compute_weights(history)
+    hb = compute_historical_bias(history, analysis["maxPainStrike"])
+    ens = compute_ensemble(analysis["maxPainStrike"], analysis["impliedPrice"],
+                            analysis["oiCenter"], analysis["volCenter"], hb, weights)
+
+    night_implied = fetch_night_session_implied(date_str).get(contract)
+    night_line = "（無夜盤資料可算隱含價，可能夜盤成交清淡）"
+    if night_implied is not None and analysis["impliedPrice"] is not None:
+        chg = night_implied - analysis["impliedPrice"]
+        direction = "漲" if chg > 0 else ("跌" if chg < 0 else "平")
+        night_line = (f"夜盤參考：夜盤隱含價 {night_implied}，比日盤 PCP隱含價 "
+                      f"{analysis['impliedPrice']} {direction} {abs(chg):.0f} 點（僅供隔夜方向參考，非結算依據）")
+
+    msg = f"""【TXO 結算日早盤播報】{today.strftime('%Y/%m/%d')}
+今天結算契約：{contract}（用 {date_str} 收盤資料計算）
+
+Ensemble 綜合預測：{fmt_or_dash(ens)}
+- Max Pain：{fmt_or_dash(analysis['maxPainStrike'])}（權重 {weights['w1']*100:.0f}%）
+- PCP隱含：{fmt_or_dash(analysis['impliedPrice'])}（權重 {weights['w2']*100:.0f}%）
+- OI重心：{fmt_or_dash(analysis['oiCenter'])}（權重 {weights['w3']*100:.0f}%）
+- 成交量加權：{fmt_or_dash(analysis['volCenter'])}（權重 {weights['w4']*100:.0f}%）
+- 歷史偏誤修正：{fmt_or_dash(hb)}（權重 {weights['w5']*100:.0f}%）
+
+{night_line}
+權重依據：{weights['source']}
+"""
+    print(msg)
+
+    # 把這次的預測值暫存起來，收盤後 closing_report() 會讀取、補上實際結算價
+    pending = {
+        "date": today.strftime("%Y/%m/%d"),
+        "contract": contract,
+        "pred": {
+            "mp": analysis["maxPainStrike"],
+            "pcp": analysis["impliedPrice"],
+            "oi": analysis["oiCenter"],
+            "vw": analysis["volCenter"],
+            "hb": hb,
+            "ens": ens,
+        },
+        "actual": None,
+    }
+    pending_file = PROJECT_DIR / "pending_prediction.json"
+    pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ============================================================
+# Step 5：盤後結算播報（含重試）
+# ============================================================
+
+def closing_report(max_retries=8, retry_interval_sec=900):
+    pending_file = PROJECT_DIR / "pending_prediction.json"
+    if not pending_file.exists():
+        print("找不到今天的早盤預測紀錄（pending_prediction.json），無法產生盤後播報。請確認早盤播報有先執行過。")
+        return
+
+    pending = json.loads(pending_file.read_text(encoding="utf-8"))
+    contract = pending["contract"]
+    today = datetime.now()
+
+    settle_price = None
+    for attempt in range(max_retries):
+        prices = fetch_settlement_prices(today.year, today.month)
+        if contract in prices:
+            settle_price = prices[contract]
+            break
+        if attempt < max_retries - 1:
+            time.sleep(retry_interval_sec)
+
+    if settle_price is None:
+        print(f"今天結算價尚未公布（已重試 {max_retries} 次），明天會補上。契約：{contract}")
+        return
+
+    pred = pending["pred"]
+    errs = {k: (pred[k] - settle_price if pred[k] is not None else None) for k in ["mp", "pcp", "oi", "vw", "hb", "ens"]}
+
+    history = load_history()
+    record = {**pending, "actual": settle_price}
+    history.append(record)
+    save_history(history)
+
+    new_weights = compute_weights(history)
+
+    def fmt(v):
+        return "—" if v is None else f"{v:+.0f}"
+
+    msg = f"""【TXO 結算日盤後播報】{today.strftime('%Y/%m/%d')}
+契約：{contract}　實際結算價：{settle_price:.0f}
+
+各方法誤差（預測 - 實際）：
+- Max Pain：{fmt(errs['mp'])}
+- PCP隱含：{fmt(errs['pcp'])}
+- OI重心：{fmt(errs['oi'])}
+- 成交量加權：{fmt(errs['vw'])}
+- 歷史偏誤修正：{fmt(errs['hb'])}
+- Ensemble：{fmt(errs['ens'])}
+
+更新後權重：MP {new_weights['w1']*100:.0f}% / PCP {new_weights['w2']*100:.0f}% / OI {new_weights['w3']*100:.0f}% / 量加權 {new_weights['w4']*100:.0f}% / 偏誤修正 {new_weights['w5']*100:.0f}%
+（{new_weights['source']}）
+"""
+    print(msg)
+    pending_file.unlink()
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "morning":
+        morning_report()
+    elif mode == "closing":
+        closing_report()
+    else:
+        print("用法：python txo_automation.py [morning|closing]")
+        sys.exit(1)
