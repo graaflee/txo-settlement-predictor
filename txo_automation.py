@@ -25,6 +25,78 @@ from urllib import request, parse
 PROJECT_DIR = Path(__file__).resolve().parent
 HISTORY_FILE = PROJECT_DIR / "backtest_history.json"
 EMAIL_CONFIG_FILE = PROJECT_DIR / "email_config.json"  # 不進 git（見 .gitignore），裡面存 Gmail 應用程式密碼
+HTML_FILE = PROJECT_DIR / "TXO結算價預測 (1).html"
+
+
+def update_html_snapshot(csv_data, date_str):
+    """把早盤播報抓到的最新 CSV 資料同步進網頁：更新 RAW_DATA、預設契約、契約選擇按鈕、
+    交易日期，效果等同於使用者手動在網頁上傳同一份 CSV（複用同樣的欄位格式與按鈕產生規則，
+    對應 HTML 裡的 rebuildContractButtons()）。找不到 HTML 檔案或寫入失敗都只印警告，不中斷主流程。"""
+    if not HTML_FILE.exists():
+        print(f"（找不到 {HTML_FILE.name}，略過網頁同步。）")
+        return
+    try:
+        html = HTML_FILE.read_text(encoding="utf-8")
+        lines = html.split("\n")
+
+        contracts = sorted(csv_data.keys())
+        if not contracts:
+            print("（CSV 沒有解析出任何契約，略過網頁同步。）")
+            return
+        first_contract = contracts[0]
+
+        raw_data_json = json.dumps(csv_data, ensure_ascii=False)
+        found_raw_data = found_current = found_header_date = found_bar = False
+
+        buttons_html = []
+        for i, key in enumerate(contracts):
+            expiry = csv_data[key].get("expiry", "") or ""
+            exp_fmt = f"{expiry[4:6]}/{expiry[6:8]}" if len(expiry) == 8 else ""
+            active = " active" if i == 0 else ""
+            buttons_html.append(
+                f'    <button class="contract-btn{active}" data-contract="{key}" onclick="selectContract(this)">'
+                f'{key}<br><span style="font-size:9px;opacity:.6">{exp_fmt}</span></button>'
+            )
+
+        out_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("const RAW_DATA = "):
+                out_lines.append(f"const RAW_DATA = {raw_data_json};")
+                found_raw_data = True
+            elif line.startswith("let currentContract = "):
+                out_lines.append(f"let currentContract = '{first_contract}';")
+                found_current = True
+            elif '<span id="headerDateVal">' in line:
+                display_date = date_str.replace("/", " / ")
+                out_lines.append(re.sub(r'(<span id="headerDateVal">)[^<]*(</span>)',
+                                         rf'\g<1>{display_date}\g<2>', line))
+                found_header_date = True
+            elif line.strip() == '<div class="contract-bar">':
+                out_lines.append(line)          # <div class="contract-bar">
+                i += 1
+                out_lines.append(lines[i])       # <label>選擇契約</label>
+                i += 1
+                while lines[i].strip() != "</div>":
+                    i += 1
+                out_lines.extend(buttons_html)
+                out_lines.append(lines[i])       # </div>
+                found_bar = True
+            else:
+                out_lines.append(line)
+            i += 1
+
+        if not (found_raw_data and found_current and found_header_date and found_bar):
+            print(f"（網頁同步：找不到預期的標記位置 raw_data={found_raw_data} "
+                  f"current={found_current} header_date={found_header_date} bar={found_bar}，"
+                  "已放棄寫入避免弄壞檔案。）")
+            return
+
+        HTML_FILE.write_text("\n".join(out_lines), encoding="utf-8")
+        print(f"（已同步網頁快照：{len(contracts)} 個契約，交易日期 {date_str}）")
+    except Exception as e:
+        print(f"（網頁同步失敗，不影響回測紀錄本身：{e}）")
 
 
 def send_email(subject, body):
@@ -102,7 +174,8 @@ def fetch_txo_csv(date_str):
     header = rows[0]
     idx = {name: header.index(name) for name in
            ["契約", "到期月份(週別)", "履約價", "買賣權", "成交量", "結算價",
-            "未沖銷契約數", "交易時段", "契約到期日", "開盤價", "最高價", "最低價", "收盤價"]
+            "未沖銷契約數", "交易時段", "契約到期日", "開盤價", "最高價", "最低價", "收盤價",
+            "最後最佳買價", "最後最佳賣價"]
            if name in header}
 
     def to_num(v):
@@ -131,9 +204,12 @@ def fetch_txo_csv(date_str):
         except ValueError:
             continue
         entry = {
+            "s": to_num(row[idx["結算價"]]),
             "v": to_num(row[idx["成交量"]]) or 0,
             "oi": to_num(row[idx["未沖銷契約數"]]) or 0,
-            "s": to_num(row[idx["結算價"]]),
+            "b": to_num(row[idx["最後最佳買價"]]),
+            "a": to_num(row[idx["最後最佳賣價"]]),
+            "c": to_num(row[idx["收盤價"]]),
         }
         opt_type = row[idx["買賣權"]].strip()
         if opt_type == "買權":
@@ -369,6 +445,8 @@ def morning_report():
     if not contract:
         print(f"{date_str} 的 CSV 裡找不到今天到期的契約，可能今天不是實際交易日或資料尚未涵蓋新契約，略過播報。")
         return
+
+    update_html_snapshot(data, date_str)
 
     analysis = analyze_contract(data[contract])
     history = load_history()

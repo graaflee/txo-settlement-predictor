@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 email_config.json
+pending_prediction.json
