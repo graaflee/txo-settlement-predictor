@@ -30,17 +30,17 @@ for k, v in expected.items():
     ok = ok and match
     print(f"analyze_contract.{k}: 預期 {v}, 實際 {got} -> {'OK' if match else 'MISMATCH'}")
 
-# --- 2) computeWeights / computeHistoricalBias / computeEnsemble 對照 ---
+# --- 2) computeWeights / computeHistoricalBias / computeEnsemble 對照（含第 6 種：夜盤隱含價 ns） ---
 hist = [
-    {"pred": {"mp": 33000, "pcp": 32717, "oi": 31539, "vw": 31966, "hb": None}, "actual": 33200},
-    {"pred": {"mp": 32800, "pcp": 32900, "oi": 31600, "vw": 32000, "hb": 33100}, "actual": 32950},
-    {"pred": {"mp": 33100, "pcp": 33050, "oi": 31700, "vw": 32100, "hb": 33000}, "actual": 33080},
+    {"pred": {"mp": 33000, "pcp": 32717, "oi": 31539, "vw": 31966, "hb": None, "ns": 33150}, "actual": 33200},
+    {"pred": {"mp": 32800, "pcp": 32900, "oi": 31600, "vw": 32000, "hb": 33100, "ns": 32980}, "actual": 32950},
+    {"pred": {"mp": 33100, "pcp": 33050, "oi": 31700, "vw": 32100, "hb": 33000, "ns": 33070}, "actual": 33080},
 ]
 hb = compute_historical_bias(hist, 33000)
 w = compute_weights(hist)
-ens = compute_ensemble(33000, 32717, 31539, 31966, 33050, w)
+ens = compute_ensemble(33000, 32717, 31539, 31966, 33050, 33120, w)
 
-checks = {"hb": (hb, 33110), "ens": (ens, 32898)}
+checks = {"hb": (hb, 33110), "ens": (ens, 33017)}
 for name, (got, expected_v) in checks.items():
     match = got == expected_v
     ok = ok and match

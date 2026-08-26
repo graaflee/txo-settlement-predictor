@@ -357,9 +357,9 @@ def compute_historical_bias(history, max_pain_strike, n=10):
 def compute_weights(history, n=10):
     done = [r for r in history if r.get("actual") is not None][-n:]
     if len(done) < 2:
-        return {"w1": .2, "w2": .2, "w3": .2, "w4": .2, "w5": .2, "source": "equal"}
+        return {"w1": 1/6, "w2": 1/6, "w3": 1/6, "w4": 1/6, "w5": 1/6, "w6": 1/6, "source": "equal"}
 
-    keys = ["mp", "pcp", "oi", "vw", "hb"]
+    keys = ["mp", "pcp", "oi", "vw", "hb", "ns"]
     mae = []
     for key in keys:
         errs = [abs((r["pred"].get(key) if r["pred"].get(key) is not None else r["actual"]) - r["actual"]) for r in done]
@@ -368,14 +368,14 @@ def compute_weights(history, n=10):
     eps = 1
     inv = [1 / (m + eps) for m in mae]
     inv_sum = sum(inv)
-    weights = {f"w{i+1}": inv[i] / inv_sum for i in range(5)}
+    weights = {f"w{i+1}": inv[i] / inv_sum for i in range(6)}
     weights["source"] = f"基於近 {len(done)} 筆回測"
     return weights
 
 
-def compute_ensemble(mp, pcp, oi, vw, hb, weights):
-    inputs = [mp, pcp, oi, vw, hb]
-    ws = [weights["w1"], weights["w2"], weights["w3"], weights["w4"], weights["w5"]]
+def compute_ensemble(mp, pcp, oi, vw, hb, ns, weights):
+    inputs = [mp, pcp, oi, vw, hb, ns]
+    ws = [weights["w1"], weights["w2"], weights["w3"], weights["w4"], weights["w5"], weights["w6"]]
     total, wsum = 0, 0
     for val, w in zip(inputs, ws):
         if val is not None:
@@ -452,19 +452,23 @@ def morning_report():
     history = load_history()
     weights = compute_weights(history)
     hb = compute_historical_bias(history, analysis["maxPainStrike"])
-    ens = compute_ensemble(analysis["maxPainStrike"], analysis["impliedPrice"],
-                            analysis["oiCenter"], analysis["volCenter"], hb, weights)
 
     # 注意：要用「今天」的日期查夜盤，不是 date_str（前一交易日）。台期所的夜盤歸屬日規則是
     # 「T-1 15:00 ~ T 05:00」算在 T 的盤後資料裡，所以「今天開盤前的那個晚上」要查今天的檔案，
     # 查 date_str（前一交易日）查到的其實是再前一晚的夜盤，等於抓錯了一天（2026-08-26 實測發現這個 bug）。
+    # 夜盤隱含價現在是第 6 種正式方法（ns），不只是參考文字——2026-08-26 實測它比其他 5 種都準，
+    # 因為部位型方法（MP/OI/量加權）反映的是前一天收盤的舊部位，夜盤隱含價則是最貼近結算時間點的市場預期。
     night_implied = fetch_night_session_implied(today.strftime("%Y/%m/%d")).get(contract)
+
+    ens = compute_ensemble(analysis["maxPainStrike"], analysis["impliedPrice"],
+                            analysis["oiCenter"], analysis["volCenter"], hb, night_implied, weights)
+
     night_line = "（無夜盤資料可算隱含價，可能夜盤成交清淡）"
     if night_implied is not None and analysis["impliedPrice"] is not None:
         chg = night_implied - analysis["impliedPrice"]
         direction = "漲" if chg > 0 else ("跌" if chg < 0 else "平")
-        night_line = (f"夜盤參考：夜盤隱含價 {night_implied}，比日盤 PCP隱含價 "
-                      f"{analysis['impliedPrice']} {direction} {abs(chg):.0f} 點（僅供隔夜方向參考，非結算依據）")
+        night_line = (f"夜盤隱含價比日盤 PCP隱含價 "
+                      f"{analysis['impliedPrice']} {direction} {abs(chg):.0f} 點")
 
     msg = f"""【TXO 結算日早盤播報】{today.strftime('%Y/%m/%d')}
 今天結算契約：{contract}（用 {date_str} 收盤資料計算）
@@ -475,8 +479,8 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 - OI重心：{fmt_or_dash(analysis['oiCenter'])}（權重 {weights['w3']*100:.0f}%）
 - 成交量加權：{fmt_or_dash(analysis['volCenter'])}（權重 {weights['w4']*100:.0f}%）
 - 歷史偏誤修正：{fmt_or_dash(hb)}（權重 {weights['w5']*100:.0f}%）
+- 夜盤隱含價：{fmt_or_dash(night_implied)}（權重 {weights['w6']*100:.0f}%）{'　' + night_line if night_implied is not None else ''}
 
-{night_line}
 權重依據：{weights['source']}
 """
     print(msg)
@@ -492,6 +496,7 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
             "oi": analysis["oiCenter"],
             "vw": analysis["volCenter"],
             "hb": hb,
+            "ns": night_implied,
             "ens": ens,
         },
         "actual": None,
@@ -537,7 +542,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
         return
 
     pred = pending["pred"]
-    errs = {k: (pred[k] - settle_price if pred[k] is not None else None) for k in ["mp", "pcp", "oi", "vw", "hb", "ens"]}
+    errs = {k: (pred[k] - settle_price if pred.get(k) is not None else None) for k in ["mp", "pcp", "oi", "vw", "hb", "ns", "ens"]}
 
     history = load_history()
     record = {**pending, "actual": settle_price}
@@ -558,9 +563,10 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 - OI重心：{fmt(errs['oi'])}
 - 成交量加權：{fmt(errs['vw'])}
 - 歷史偏誤修正：{fmt(errs['hb'])}
+- 夜盤隱含價：{fmt(errs['ns'])}
 - Ensemble：{fmt(errs['ens'])}
 
-更新後權重：MP {new_weights['w1']*100:.0f}% / PCP {new_weights['w2']*100:.0f}% / OI {new_weights['w3']*100:.0f}% / 量加權 {new_weights['w4']*100:.0f}% / 偏誤修正 {new_weights['w5']*100:.0f}%
+更新後權重：MP {new_weights['w1']*100:.0f}% / PCP {new_weights['w2']*100:.0f}% / OI {new_weights['w3']*100:.0f}% / 量加權 {new_weights['w4']*100:.0f}% / 偏誤修正 {new_weights['w5']*100:.0f}% / 夜盤 {new_weights['w6']*100:.0f}%
 （{new_weights['source']}）
 """
     print(msg)
