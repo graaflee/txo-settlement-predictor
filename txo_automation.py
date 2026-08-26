@@ -455,7 +455,10 @@ def morning_report():
     ens = compute_ensemble(analysis["maxPainStrike"], analysis["impliedPrice"],
                             analysis["oiCenter"], analysis["volCenter"], hb, weights)
 
-    night_implied = fetch_night_session_implied(date_str).get(contract)
+    # 注意：要用「今天」的日期查夜盤，不是 date_str（前一交易日）。台期所的夜盤歸屬日規則是
+    # 「T-1 15:00 ~ T 05:00」算在 T 的盤後資料裡，所以「今天開盤前的那個晚上」要查今天的檔案，
+    # 查 date_str（前一交易日）查到的其實是再前一晚的夜盤，等於抓錯了一天（2026-08-26 實測發現這個 bug）。
+    night_implied = fetch_night_session_implied(today.strftime("%Y/%m/%d")).get(contract)
     night_line = "（無夜盤資料可算隱含價，可能夜盤成交清淡）"
     if night_implied is not None and analysis["impliedPrice"] is not None:
         chg = night_implied - analysis["impliedPrice"]
