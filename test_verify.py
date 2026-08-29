@@ -40,7 +40,7 @@ hb = compute_historical_bias(hist, 33000)
 w = compute_weights(hist)
 ens = compute_ensemble(33000, 32717, 31539, 31966, 33050, 33120, w)
 
-checks = {"hb": (hb, 33110), "ens": (ens, 33017)}
+checks = {"hb": (hb, 33110), "ens": (ens, 33015)}
 for name, (got, expected_v) in checks.items():
     match = got == expected_v
     ok = ok and match

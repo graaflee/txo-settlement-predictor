@@ -359,15 +359,26 @@ def compute_weights(history, n=10):
     if len(done) < 2:
         return {"w1": 1/6, "w2": 1/6, "w3": 1/6, "w4": 1/6, "w5": 1/6, "w6": 1/6, "source": "equal"}
 
+    # 只用「這個方法真的有給過預測值」的那幾筆算 MAE，不要把缺值當成誤差 0（不然一個方法
+    # 還沒累積出真實預測值時，會被 inverse-MAE 誤判成「完美」，把權重拉爆）。
+    # 一筆預測值都沒有的方法，直接給權重 0，不參與 inverse-MAE 計算。
     keys = ["mp", "pcp", "oi", "vw", "hb", "ns"]
     mae = []
+    has_data = []
     for key in keys:
-        errs = [abs((r["pred"].get(key) if r["pred"].get(key) is not None else r["actual"]) - r["actual"]) for r in done]
-        mae.append(sum(errs) / len(errs))
+        errs = [abs(r["pred"][key] - r["actual"]) for r in done if r["pred"].get(key) is not None]
+        if errs:
+            mae.append(sum(errs) / len(errs))
+            has_data.append(True)
+        else:
+            mae.append(None)
+            has_data.append(False)
 
     eps = 1
-    inv = [1 / (m + eps) for m in mae]
+    inv = [1 / (m + eps) if has_data[i] else 0 for i, m in enumerate(mae)]
     inv_sum = sum(inv)
+    if inv_sum == 0:
+        return {"w1": 1/6, "w2": 1/6, "w3": 1/6, "w4": 1/6, "w5": 1/6, "w6": 1/6, "source": "equal"}
     weights = {f"w{i+1}": inv[i] / inv_sum for i in range(6)}
     weights["source"] = f"基於近 {len(done)} 筆回測"
     return weights
