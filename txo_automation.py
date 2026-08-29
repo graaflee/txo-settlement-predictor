@@ -516,6 +516,74 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
     pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+METHOD_NAMES = {"mp": "Max Pain", "pcp": "PCP隱含", "oi": "OI重心",
+                 "vw": "成交量加權", "hb": "歷史偏誤修正", "ns": "夜盤隱含價"}
+POSITION_BASED = {"mp", "oi", "vw"}   # 部位型：反映前一天收盤的舊部位
+FORWARD_LOOKING = {"pcp", "ns"}       # 前瞻型：反映即時/接近結算時點的市場預期
+
+
+def build_discrepancy_report(record, history, n=10):
+    """比對這次結算誤差跟近期回測歷史，判斷趨勢、方法排名，產生類似人工分析的差異報告文字。
+    邏輯是把 2026-08-26/08-28 兩次手動分析時用的推論方式（趨勢盤中部位型方法系統性落後、
+    比較近期哪個方法最準）寫成規則，不是每次都重新用 LLM 分析。"""
+    pred, actual = record["pred"], record["actual"]
+    errs = {k: (pred[k] - actual) for k in METHOD_NAMES if pred.get(k) is not None}
+    lines = []
+
+    # 1) 這次表現排名
+    ranked_this = sorted(errs.items(), key=lambda kv: abs(kv[1]))
+    if ranked_this:
+        best_key, best_err = ranked_this[0]
+        worst_key, worst_err = ranked_this[-1]
+        lines.append(f"這次最準：{METHOD_NAMES[best_key]}（誤差 {best_err:+.0f} 點）；"
+                     f"最差：{METHOD_NAMES[worst_key]}（誤差 {worst_err:+.0f} 點）")
+
+    # 2) 趨勢判斷：看最近幾次「已結算」的實際價格是否連續同向
+    done = [r for r in history if r.get("actual") is not None]
+    recent_actuals = [r["actual"] for r in done[-4:]]
+    trend = None
+    if len(recent_actuals) >= 3:
+        diffs = [recent_actuals[i + 1] - recent_actuals[i] for i in range(len(recent_actuals) - 1)]
+        if all(d > 0 for d in diffs):
+            trend = "up"
+        elif all(d < 0 for d in diffs):
+            trend = "down"
+    if trend == "up":
+        lines.append(f"近 {len(recent_actuals)} 個結算日連續上漲（{recent_actuals[0]:.0f} → {recent_actuals[-1]:.0f}），屬於連續趨勢盤。")
+    elif trend == "down":
+        lines.append(f"近 {len(recent_actuals)} 個結算日連續下跌（{recent_actuals[0]:.0f} → {recent_actuals[-1]:.0f}），屬於連續趨勢盤。")
+
+    # 3) 部位型 vs 前瞻型 系統性偏差判斷（只在確認是趨勢盤時才下這個結論，避免亂歸因）
+    if trend is not None and errs:
+        pos_errs = [errs[k] for k in errs if k in POSITION_BASED]
+        fwd_errs = [errs[k] for k in errs if k in FORWARD_LOOKING]
+        if pos_errs and fwd_errs:
+            pos_avg = sum(pos_errs) / len(pos_errs)
+            fwd_avg = sum(fwd_errs) / len(fwd_errs)
+            if abs(pos_avg) > abs(fwd_avg) * 1.3:
+                direction = "低估" if pos_avg < 0 else "高估"
+                lines.append(f"部位型方法（Max Pain/OI重心/成交量加權）平均{direction} {abs(pos_avg):.0f} 點，"
+                             f"比前瞻型方法（PCP隱含/夜盤隱含價，平均誤差 {fwd_avg:+.0f} 點）差不少——"
+                             f"符合「連續趨勢盤時部位型方法系統性落後」的已知模式。")
+
+    # 4) 近期（近 n 筆）各方法平均表現排名
+    window = done[-n:]
+    if len(window) >= 2:
+        method_mae = {}
+        for key in METHOD_NAMES:
+            vals = [abs(r["pred"][key] - r["actual"]) for r in window if r["pred"].get(key) is not None]
+            if vals:
+                method_mae[key] = sum(vals) / len(vals)
+        if method_mae:
+            best_recent = min(method_mae, key=method_mae.get)
+            worst_recent = max(method_mae, key=method_mae.get)
+            lines.append(f"近 {len(window)} 筆回測平均表現：「{METHOD_NAMES[best_recent]}」最好"
+                         f"（平均誤差 {method_mae[best_recent]:.0f} 點），"
+                         f"「{METHOD_NAMES[worst_recent]}」最差（平均誤差 {method_mae[worst_recent]:.0f} 點）。")
+
+    return "\n".join(f"- {l}" for l in lines) if lines else "（回測紀錄還不夠多，之後累積更多筆才能看出趨勢）"
+
+
 # ============================================================
 # Step 5：盤後結算播報
 # ============================================================
@@ -561,6 +629,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
     save_history(history)
 
     new_weights = compute_weights(history)
+    discrepancy = build_discrepancy_report(record, history)
 
     def fmt(v):
         return "—" if v is None else f"{v:+.0f}"
@@ -579,6 +648,9 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 
 更新後權重：MP {new_weights['w1']*100:.0f}% / PCP {new_weights['w2']*100:.0f}% / OI {new_weights['w3']*100:.0f}% / 量加權 {new_weights['w4']*100:.0f}% / 偏誤修正 {new_weights['w5']*100:.0f}% / 夜盤 {new_weights['w6']*100:.0f}%
 （{new_weights['source']}）
+
+【差異分析】
+{discrepancy}
 """
     print(msg)
     send_email(f"【TXO盤後播報】{contract} 結算 {settle_price:.0f}", msg)
