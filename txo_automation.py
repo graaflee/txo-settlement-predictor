@@ -99,6 +99,33 @@ def update_html_snapshot(csv_data, date_str):
         print(f"（網頁同步失敗，不影響回測紀錄本身：{e}）")
 
 
+def sync_bt_history_to_html():
+    """把 backtest_history.json 的內容烘進網頁的 BAKED_BT_HISTORY，使用者在自己電腦打開網頁時
+    （見 HTML 裡的 mergeBakedBtHistory()）會自動併入瀏覽器的 localStorage，不用手動同步。
+    跟 update_html_snapshot() 分開處理：盤後結算播報沒有重新抓 CSV，不需要走那條路徑，
+    只需要更新回測歷史這一個標記。"""
+    if not HTML_FILE.exists():
+        return
+    try:
+        html = HTML_FILE.read_text(encoding="utf-8")
+        lines = html.split("\n")
+        history = load_history()
+        history_json = json.dumps(history, ensure_ascii=False)
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith("const BAKED_BT_HISTORY = "):
+                lines[i] = f"const BAKED_BT_HISTORY = {history_json};"
+                found = True
+                break
+        if not found:
+            print("（網頁同步：找不到 BAKED_BT_HISTORY 標記，略過回測歷史同步。）")
+            return
+        HTML_FILE.write_text("\n".join(lines), encoding="utf-8")
+        print(f"（已同步 {len(history)} 筆回測歷史進網頁）")
+    except Exception as e:
+        print(f"（回測歷史同步失敗，不影響紀錄本身：{e}）")
+
+
 def send_email(subject, body):
     """用 Gmail SMTP 寄一封通知信給自己，讓手機上的 Gmail app 推播出來。
     設定檔不存在或內容不完整時，只印出警告、不讓整支腳本因為寄信失敗而中斷。"""
@@ -458,6 +485,7 @@ def morning_report():
         return
 
     update_html_snapshot(data, date_str)
+    sync_bt_history_to_html()
 
     analysis = analyze_contract(data[contract])
     history = load_history()
@@ -627,6 +655,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
     record = {**pending, "actual": settle_price}
     history.append(record)
     save_history(history)
+    sync_bt_history_to_html()
 
     new_weights = compute_weights(history)
     discrepancy = build_discrepancy_report(record, history)
