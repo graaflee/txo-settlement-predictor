@@ -27,6 +27,38 @@ HISTORY_FILE = PROJECT_DIR / "backtest_history.json"
 EMAIL_CONFIG_FILE = PROJECT_DIR / "email_config.json"  # 不進 git（見 .gitignore），裡面存 Gmail 應用程式密碼
 HTML_FILE = PROJECT_DIR / "TXO結算價預測 (1).html"
 
+# 另一個 Claude session 維護的券商信件情報資料庫（見該目錄的 README.md）。
+# 這批資料要靠 LLM 讀 Gmail/PDF 才能更新，不是本腳本能自動維護的，只負責讀取現有內容；
+# 讀不到檔案或當天沒資料都安靜略過，不影響本腳本主流程。
+BROKER_REPORTS_DIR = Path(r"C:\Users\A113010\Documents\Claude基本功\broker-reports")
+BROKER_RELEVANT_KEYWORDS = ("大盤", "指數期貨", "選擇權")
+
+
+def get_broker_context(date_str):
+    """讀 broker-reports/records/YYYY-MM.json，抓出跟大盤/指數期貨/選擇權相關、
+    日期符合的報告摘要，當作播報信裡的質化補充參考。date_str 格式 'YYYY/MM/DD'。"""
+    try:
+        date_dash = date_str.replace("/", "-")
+        year_month = date_dash[:7]
+        record_file = BROKER_REPORTS_DIR / "records" / f"{year_month}.json"
+        if not record_file.exists():
+            return []
+        records = json.loads(record_file.read_text(encoding="utf-8"))
+        return [
+            r for r in records
+            if r.get("date") == date_dash
+            and any(kw in (r.get("category") or "") for kw in BROKER_RELEVANT_KEYWORDS)
+        ]
+    except Exception:
+        return []
+
+
+def format_broker_context(items):
+    if not items:
+        return ""
+    lines = [f"- [{b.get('broker','?')}] {b.get('subject','')}：{b.get('summary','')}" for b in items]
+    return "\n【當天券商報告參考（另一套 Gmail 抓信系統維護，非本腳本自動更新）】\n" + "\n".join(lines)
+
 
 def update_html_snapshot(csv_data, date_str):
     """把早盤播報抓到的最新 CSV 資料同步進網頁：更新 RAW_DATA、預設契約、契約選擇按鈕、
@@ -509,6 +541,10 @@ def morning_report():
         night_line = (f"夜盤隱含價比日盤 PCP隱含價 "
                       f"{analysis['impliedPrice']} {direction} {abs(chg):.0f} 點")
 
+    # 券商報告參考：用 date_str（前一交易日）而不是今天，因為凱基的盤後日報是「前一天收盤後」
+    # 發的，時間點剛好對應這次早盤預測所用的 CSV 資料（同一個交易日）。
+    broker_context = format_broker_context(get_broker_context(date_str))
+
     msg = f"""【TXO 結算日早盤播報】{today.strftime('%Y/%m/%d')}
 今天結算契約：{contract}（用 {date_str} 收盤資料計算）
 
@@ -521,6 +557,7 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 - 夜盤隱含價：{fmt_or_dash(night_implied)}（權重 {weights['w6']*100:.0f}%）{'　' + night_line if night_implied is not None else ''}
 
 權重依據：{weights['source']}
+{broker_context}
 """
     print(msg)
     send_email(f"【TXO早盤播報】{contract} 結算日", msg)
@@ -659,6 +696,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 
     new_weights = compute_weights(history)
     discrepancy = build_discrepancy_report(record, history)
+    broker_context = format_broker_context(get_broker_context(record["date"]))
 
     def fmt(v):
         return "—" if v is None else f"{v:+.0f}"
@@ -680,6 +718,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 
 【差異分析】
 {discrepancy}
+{broker_context}
 """
     print(msg)
     send_email(f"【TXO盤後播報】{contract} 結算 {settle_price:.0f}", msg)
