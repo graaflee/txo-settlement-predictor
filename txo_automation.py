@@ -13,6 +13,7 @@ TXO 結算價自動化核心腳本
 import sys
 import json
 import csv
+import subprocess
 import io
 import re
 import time
@@ -184,6 +185,32 @@ def send_email(subject, body):
         print("（已寄出通知信）")
     except Exception as e:
         print(f"（寄信失敗，不影響回測紀錄本身：{e}）")
+
+
+def git_commit_and_push(message):
+    """排程跑完後，把這次產生的變更（網頁快照、回測歷史）commit + push 回 GitHub。
+    2026-09-09 發現：網頁的即時資料只存在工作目錄裡、從沒進版控，導致一次 git revert
+    意外把當天排程剛同步的資料洗掉。加這個之後，每次排程跑完都會留下一個版本快照，
+    之後任何 git 操作要動到這兩個檔案，都至少有紀錄可以救回來。
+    這一步失敗（沒網路、git 沒設定等）只印警告，此時播報跟寄信都已經做完了，不影響主流程。"""
+    try:
+        subprocess.run(["git", "add", "TXO結算價預測 (1).html", "backtest_history.json"],
+                        cwd=PROJECT_DIR, check=True, capture_output=True, text=True, encoding="utf-8")
+        commit = subprocess.run(["git", "commit", "-m", message],
+                                 cwd=PROJECT_DIR, capture_output=True, text=True, encoding="utf-8")
+        if commit.returncode != 0:
+            if "nothing to commit" in (commit.stdout + commit.stderr):
+                print("（git：這次沒有變更需要 commit）")
+            else:
+                print(f"（git commit 失敗，不影響主流程：{commit.stderr.strip() or commit.stdout.strip()}）")
+            return
+        push = subprocess.run(["git", "push"], cwd=PROJECT_DIR, capture_output=True, text=True, encoding="utf-8")
+        if push.returncode != 0:
+            print(f"（已本機 commit，但 push 失敗（可能沒網路），之後可以手動 push：{push.stderr.strip()}）")
+        else:
+            print("（已自動 commit + push 這次的網頁快照與回測歷史）")
+    except Exception as e:
+        print(f"（git 自動 commit 失敗，不影響主流程：{e}）")
 
 
 def fmt_or_dash(v):
@@ -580,6 +607,8 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
     pending_file = PROJECT_DIR / "pending_prediction.json"
     pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    git_commit_and_push(f"早盤播報 {today.strftime('%Y/%m/%d')} {contract}")
+
 
 METHOD_NAMES = {"mp": "Max Pain", "pcp": "PCP隱含", "oi": "OI重心",
                  "vw": "成交量加權", "hb": "歷史偏誤修正", "ns": "夜盤隱含價"}
@@ -723,6 +752,8 @@ def closing_report(max_retries=1, retry_interval_sec=0):
     print(msg)
     send_email(f"【TXO盤後播報】{contract} 結算 {settle_price:.0f}", msg)
     pending_file.unlink()
+
+    git_commit_and_push(f"盤後結算 {record['date']} {contract} 實際{settle_price:.0f}")
 
 
 if __name__ == "__main__":
