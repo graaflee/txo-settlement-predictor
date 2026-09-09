@@ -1,12 +1,17 @@
 """
 TXO 結算價自動化核心腳本
 
-用法：
-    python txo_automation.py morning   # 結算日 8:00 早盤播報
-    python txo_automation.py closing   # 結算日收盤後結算播報（含重試）
+用法（每個交易日 Mon-Fri 都跑，不限結算日）：
+    python txo_automation.py predict_am   # 約 07:00，盤後/夜盤收盤後的預測更新
+    python txo_automation.py predict_pm   # 約 14:00，日盤收盤後的預測更新（一定要用當天CSV）
+    python txo_automation.py closing      # 只在真正結算日排程（週三/週五），收盤後結算播報（含重試）
+
+predict_am/predict_pm 都會找「最近一個還沒結算的契約」播報，平常交易日也會有內容；
+只有 predict_am 算出來的最近契約「到期日剛好是今天」時，才會存 pending_prediction.json
+給 closing_report() 用，回測仍然只在真正結算日才會有記錄。
 
 資料來源說明見同資料夾的「資料擷取方式.md」。
-5 種預測方法（Max Pain / PCP隱含 / OI重心 / 成交量加權 / 歷史偏誤修正）與加權邏輯，
+6 種預測方法（Max Pain / PCP隱含 / OI重心 / 成交量加權 / 歷史偏誤修正 / 夜盤隱含價）與加權邏輯，
 對應 HTML 裡的 analyzeContract() / computeWeights() / computeEnsemble() / computeHistoricalBias()。
 """
 
@@ -199,7 +204,8 @@ def git_commit_and_push(message):
         commit = subprocess.run(["git", "commit", "-m", message],
                                  cwd=PROJECT_DIR, capture_output=True, text=True, encoding="utf-8")
         if commit.returncode != 0:
-            if "nothing to commit" in (commit.stdout + commit.stderr):
+            out = commit.stdout + commit.stderr
+            if "nothing to commit" in out or "no changes added to commit" in out:
                 print("（git：這次沒有變更需要 commit）")
             else:
                 print(f"（git commit 失敗，不影響主流程：{commit.stderr.strip() or commit.stdout.strip()}）")
@@ -499,13 +505,26 @@ def save_history(history):
 # 判斷今天是否為結算日、要結算哪個契約
 # ============================================================
 
-def find_todays_settling_contract(csv_data, today):
-    """在 csv_data（{契約: {...expiry}}）裡找契約到期日等於今天的契約。"""
-    today_str = today.strftime("%Y%m%d")
+def find_nearest_contract(csv_data, today):
+    """在 csv_data（{契約: {...expiry}}）裡找到期日 >= 今天、且最接近今天的契約。
+    回傳 (contract, expiry_date)；找不到（例如資料是舊的、全部已過期）回傳 (None, None)。
+    2026-09-09 起取代 find_todays_settling_contract()：預測不再限定「今天正好結算」，
+    平常交易日也要能找到「最近一個還沒結算的週選」來持續更新預測。"""
+    candidates = []
     for contract, data in csv_data.items():
-        if data["expiry"] == today_str:
-            return contract
-    return None
+        expiry_str = data.get("expiry", "") or ""
+        if len(expiry_str) != 8:
+            continue
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%Y%m%d")
+        except ValueError:
+            continue
+        if expiry_date.date() >= today.date():
+            candidates.append((expiry_date, contract))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1], candidates[0][0]
 
 
 def fetch_latest_csv(start_date, max_back_days=5):
@@ -521,27 +540,36 @@ def fetch_latest_csv(start_date, max_back_days=5):
 
 
 # ============================================================
-# Step 4：8:00 早盤播報
+# Step 4：每個交易日兩次的預測更新播報
+# 2026-09-09 改版：不再限定「今天正好結算才播報」，改成每個交易日跑兩次——
+#   predict_am()：約 07:00（盤後/夜盤收盤後），用最新可得的盤後 CSV（通常是前一交易日）
+#   predict_pm()：約 14:00（日盤收盤後），一定要用「今天自己」的 CSV，資料還沒公布就先跳過等重試
+# 兩次都預測「最近一個還沒結算的契約」，不是只有結算日當天才有東西可報。
+# 只有 predict_am() 在算出來的最近契約「到期日剛好是今天」時，才會寫 pending_prediction.json
+# 給 closing_report() 用——這樣回測書籍仍然只在真正的結算日才會有記錄（維持原本的設計），
+# predict_pm() 純粹是資訊性的更新，完全不碰 pending_prediction.json，兩者不會互相覆蓋。
 # ============================================================
 
-def morning_report():
+def generate_prediction_report(session_label, use_today_csv):
     today = datetime.now()
-    # TXO 週選結算日：週三(W系列，含月選) 或 週五(F系列，2025-06-27上市)。0=Mon ... 2=Wed, 4=Fri
-    if today.weekday() not in (2, 4):
-        print("今天不是週三或週五，非 TXO 結算日，不執行早盤播報。")
-        return
 
-    # 用前一交易日的盤後 CSV 找出今天要結算的契約
-    yesterday = today - timedelta(days=1)
-    date_str, data = fetch_latest_csv(yesterday)
-    if not data:
-        print("找不到最近的盤後 CSV，無法產生早盤播報。")
-        return
+    if use_today_csv:
+        date_str = today.strftime("%Y/%m/%d")
+        data = fetch_txo_csv(date_str)
+        if not data:
+            print(f"{date_str} 的盤後 CSV 尚未公布，稍後排程會再試一次，暫不播報。")
+            return
+    else:
+        date_str, data = fetch_latest_csv(today)
+        if not data:
+            print("找不到最近的盤後 CSV，無法產生播報。")
+            return
 
-    contract = find_todays_settling_contract(data, today)
+    contract, expiry_date = find_nearest_contract(data, today)
     if not contract:
-        print(f"{date_str} 的 CSV 裡找不到今天到期的契約，可能今天不是實際交易日或資料尚未涵蓋新契約，略過播報。")
+        print(f"{date_str} 的 CSV 裡找不到任何尚未到期的契約，略過播報。")
         return
+    is_settlement_today = expiry_date.date() == today.date()
 
     update_html_snapshot(data, date_str)
     sync_bt_history_to_html()
@@ -551,11 +579,9 @@ def morning_report():
     weights = compute_weights(history)
     hb = compute_historical_bias(history, analysis["maxPainStrike"])
 
-    # 注意：要用「今天」的日期查夜盤，不是 date_str（前一交易日）。台期所的夜盤歸屬日規則是
-    # 「T-1 15:00 ~ T 05:00」算在 T 的盤後資料裡，所以「今天開盤前的那個晚上」要查今天的檔案，
-    # 查 date_str（前一交易日）查到的其實是再前一晚的夜盤，等於抓錯了一天（2026-08-26 實測發現這個 bug）。
-    # 夜盤隱含價現在是第 6 種正式方法（ns），不只是參考文字——2026-08-26 實測它比其他 5 種都準，
-    # 因為部位型方法（MP/OI/量加權）反映的是前一天收盤的舊部位，夜盤隱含價則是最貼近結算時間點的市場預期。
+    # 注意：要用「今天」的日期查夜盤，不是 date_str。台期所的夜盤歸屬日規則是
+    # 「T-1 15:00 ~ T 05:00」算在 T 的盤後資料裡，所以「今天開盤前的那個晚上」要查今天的檔案
+    # （2026-08-26 實測發現查錯日期的 bug）。夜盤隱含價是第 6 種正式方法，不只是參考文字。
     night_implied = fetch_night_session_implied(today.strftime("%Y/%m/%d")).get(contract)
 
     ens = compute_ensemble(analysis["maxPainStrike"], analysis["impliedPrice"],
@@ -568,12 +594,12 @@ def morning_report():
         night_line = (f"夜盤隱含價比日盤 PCP隱含價 "
                       f"{analysis['impliedPrice']} {direction} {abs(chg):.0f} 點")
 
-    # 券商報告參考：用 date_str（前一交易日）而不是今天，因為凱基的盤後日報是「前一天收盤後」
-    # 發的，時間點剛好對應這次早盤預測所用的 CSV 資料（同一個交易日）。
     broker_context = format_broker_context(get_broker_context(date_str))
+    contract_line = (f"{contract}（今天結算，用 {date_str} 資料計算）" if is_settlement_today
+                      else f"{contract}（{expiry_date.strftime('%m/%d')} 結算，用 {date_str} 資料計算）")
 
-    msg = f"""【TXO 結算日早盤播報】{today.strftime('%Y/%m/%d')}
-今天結算契約：{contract}（用 {date_str} 收盤資料計算）
+    msg = f"""【TXO {session_label}播報】{today.strftime('%Y/%m/%d')}
+最近待結算契約：{contract_line}
 
 Ensemble 綜合預測：{fmt_or_dash(ens)}
 - Max Pain：{fmt_or_dash(analysis['maxPainStrike'])}（權重 {weights['w1']*100:.0f}%）
@@ -587,27 +613,38 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 {broker_context}
 """
     print(msg)
-    send_email(f"【TXO早盤播報】{contract} 結算日", msg)
+    send_email(f"【TXO {session_label}播報】{contract}{'（今天結算）' if is_settlement_today else ''}", msg)
 
-    # 把這次的預測值暫存起來，收盤後 closing_report() 會讀取、補上實際結算價
-    pending = {
-        "date": today.strftime("%Y/%m/%d"),
-        "contract": contract,
-        "pred": {
-            "mp": analysis["maxPainStrike"],
-            "pcp": analysis["impliedPrice"],
-            "oi": analysis["oiCenter"],
-            "vw": analysis["volCenter"],
-            "hb": hb,
-            "ns": night_implied,
-            "ens": ens,
-        },
-        "actual": None,
-    }
-    pending_file = PROJECT_DIR / "pending_prediction.json"
-    pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+    if is_settlement_today:
+        pending = {
+            "date": today.strftime("%Y/%m/%d"),
+            "contract": contract,
+            "pred": {
+                "mp": analysis["maxPainStrike"],
+                "pcp": analysis["impliedPrice"],
+                "oi": analysis["oiCenter"],
+                "vw": analysis["volCenter"],
+                "hb": hb,
+                "ns": night_implied,
+                "ens": ens,
+            },
+            "actual": None,
+        }
+        pending_file = PROJECT_DIR / "pending_prediction.json"
+        pending_file.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("（今天是這個契約的結算日，已存下預測值供盤後結算比對）")
 
-    git_commit_and_push(f"早盤播報 {today.strftime('%Y/%m/%d')} {contract}")
+    git_commit_and_push(f"{session_label} {today.strftime('%Y/%m/%d')} {contract}")
+
+
+def predict_am():
+    """約 07:00 執行：盤後/夜盤收盤後的預測更新。"""
+    generate_prediction_report("盤後收盤", use_today_csv=False)
+
+
+def predict_pm():
+    """約 14:00 執行：日盤收盤後的預測更新，一定要用當天自己的 CSV（還沒公布就先跳過等重試）。"""
+    generate_prediction_report("早盤收盤", use_today_csv=True)
 
 
 METHOD_NAMES = {"mp": "Max Pain", "pcp": "PCP隱含", "oi": "OI重心",
@@ -758,10 +795,12 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode == "morning":
-        morning_report()
+    if mode == "predict_am":
+        predict_am()
+    elif mode == "predict_pm":
+        predict_pm()
     elif mode == "closing":
         closing_report()
     else:
-        print("用法：python txo_automation.py [morning|closing]")
+        print("用法：python txo_automation.py [predict_am|predict_pm|closing]")
         sys.exit(1)
