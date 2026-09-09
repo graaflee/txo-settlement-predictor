@@ -399,10 +399,6 @@ def analyze_contract(data):
         "impliedPrice": implied_price,
         "oiCenter": oi_center,
         "volCenter": vol_center,
-        "callCenter": call_center,
-        "putCenter": put_center,
-        "callVolCenter": call_vcenter,
-        "putVolCenter": put_vcenter,
         "expiry": data["expiry"],
     }
 
@@ -559,10 +555,6 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 - 成交量加權：{fmt_or_dash(analysis['volCenter'])}（權重 {weights['w4']*100:.0f}%）
 - 歷史偏誤修正：{fmt_or_dash(hb)}（權重 {weights['w5']*100:.0f}%）
 - 夜盤隱含價：{fmt_or_dash(night_implied)}（權重 {weights['w6']*100:.0f}%）{'　' + night_line if night_implied is not None else ''}
-
-買權/賣權分開看（Max Pain 公式上無法有意義拆開，只列可拆的兩種）：
-- OI重心：買權 {fmt_or_dash(analysis['callCenter'])} / 賣權 {fmt_or_dash(analysis['putCenter'])}
-- 成交量加權：買權 {fmt_or_dash(analysis['callVolCenter'])} / 賣權 {fmt_or_dash(analysis['putVolCenter'])}
 
 權重依據：{weights['source']}
 {broker_context}
