@@ -550,7 +550,7 @@ def fetch_latest_csv(start_date, max_back_days=5):
 # predict_pm() 純粹是資訊性的更新，完全不碰 pending_prediction.json，兩者不會互相覆蓋。
 # ============================================================
 
-def generate_prediction_report(session_label, use_today_csv):
+def generate_prediction_report(session_label, use_today_csv, save_pending):
     today = datetime.now()
 
     if use_today_csv:
@@ -615,7 +615,7 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
     print(msg)
     send_email(f"【TXO {session_label}播報】{contract}{'（今天結算）' if is_settlement_today else ''}", msg)
 
-    if is_settlement_today:
+    if is_settlement_today and save_pending:
         pending = {
             "date": today.strftime("%Y/%m/%d"),
             "contract": contract,
@@ -638,13 +638,19 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 
 
 def predict_am():
-    """約 07:00 執行：盤後/夜盤收盤後的預測更新。"""
-    generate_prediction_report("盤後收盤", use_today_csv=False)
+    """約 07:00 執行：盤後/夜盤收盤後的預測更新。save_pending=True——只有這個時段的執行
+    會在結算日寫 pending_prediction.json 給 closing_report() 用。"""
+    generate_prediction_report("盤後收盤", use_today_csv=False, save_pending=True)
 
 
 def predict_pm():
-    """約 14:00 執行：日盤收盤後的預測更新，一定要用當天自己的 CSV（還沒公布就先跳過等重試）。"""
-    generate_prediction_report("早盤收盤", use_today_csv=True)
+    """約 14:00 執行：日盤收盤後的預測更新，一定要用當天自己的 CSV（還沒公布就先跳過等重試）。
+    save_pending=False——2026-09-09 發現：這個時段如果也寫 pending_prediction.json，
+    跟它自己的 14:00/14:30/15:00 重試、以及 closing_report() 的 15:00/16:00/17:00 重試
+    時間點重疊，可能出現「回測先消化掉早上那筆並刪除檔案，這裡的重試又重新寫一份新的，
+    回測下一次重試又把它當成新資料再記一次」的重複記錄。只讓 predict_am() 寫這個檔案就
+    不會有這個問題，predict_pm() 純粹是資訊性更新。"""
+    generate_prediction_report("早盤收盤", use_today_csv=True, save_pending=False)
 
 
 METHOD_NAMES = {"mp": "Max Pain", "pcp": "PCP隱含", "oi": "OI重心",
