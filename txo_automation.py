@@ -5,6 +5,8 @@ TXO 結算價自動化核心腳本
     python txo_automation.py predict_am   # 約 07:00，盤後/夜盤收盤後的預測更新
     python txo_automation.py predict_pm   # 約 14:00，日盤收盤後的預測更新（一定要用當天CSV）
     python txo_automation.py closing      # 只在真正結算日排程（週三/週五），收盤後結算播報（含重試）
+    python txo_automation.py intraday_pcp # 日盤/夜盤期間排程（例如每30分鐘），用永豐Shioaji即時報價
+                                           # 算盤中PCP隱含價，寫進網頁、變動夠大才寄信提醒（見 shioaji_config.json）
 
 predict_am/predict_pm 都會找「最近一個還沒結算的契約」播報，平常交易日也會有內容；
 只有 predict_am 算出來的最近契約「到期日剛好是今天」時，才會存 pending_prediction.json
@@ -32,6 +34,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 HISTORY_FILE = PROJECT_DIR / "backtest_history.json"
 EMAIL_CONFIG_FILE = PROJECT_DIR / "email_config.json"  # 不進 git（見 .gitignore），裡面存 Gmail 應用程式密碼
 HTML_FILE = PROJECT_DIR / "TXO結算價預測 (1).html"
+SHIOAJI_CONFIG_FILE = PROJECT_DIR / "shioaji_config.json"  # 不進 git，裡面存永豐 API Key/Secret
+INTRADAY_STATE_FILE = PROJECT_DIR / "intraday_pcp_state.json"  # 不進 git，只是拿來跟上次比對用的暫存值
+INTRADAY_ALERT_THRESHOLD = 30  # 盤中隱含價比上次記錄變動超過這個點數才寄信提醒，避免每次排程都寄信
 
 # 另一個 Claude session 維護的券商信件情報資料庫（見該目錄的 README.md）。
 # 這批資料要靠 LLM 讀 Gmail/PDF 才能更新，不是本腳本能自動維護的，只負責讀取現有內容；
@@ -162,6 +167,155 @@ def sync_bt_history_to_html():
         print(f"（已同步 {len(history)} 筆回測歷史進網頁）")
     except Exception as e:
         print(f"（回測歷史同步失敗，不影響紀錄本身：{e}）")
+
+
+# ============================================================
+# 盤中即時 PCP（永豐 Shioaji API）
+# 2026-09-17 新增：TAIFEX 的未沖銷契約數（OI）本質上是收盤清算後才產生的每日數字，
+# 不管哪家券商 API 都不可能有「盤中即時 OI」，所以 Max Pain / OI重心 / 歷史偏誤修正
+# 這 3 個方法沒辦法靠 Shioaji 變成盤中即時。但 PCP隱含價只需要買權/賣權的即時報價，
+# Shioaji 有免費的盤中即時行情，剛好補上這塊——純粹是資訊性的獨立指標，
+# 不納入 Ensemble/權重計算（那套機制仍然只根據每日一次的正式回測紀錄運作），
+# 只在網頁上多顯示一個「盤中隱含價」，並在變動夠大時額外寄信提醒。
+# ============================================================
+
+def find_nearest_txo_chain(api, today):
+    """動態掃過 Shioaji 目前所有選擇權分類，抓出「臺指選擇權」家族
+    （underlying_code == 'IX0001'，涵蓋月選 TXO 與所有週選分類）合約，
+    回傳到期日 >= today 最近的一組 (到期日, {履約價: call合約}, {履約價: put合約})。
+    不寫死 TXO/TX4/TX5/TXX/TXY 這些週選 root 代碼——台期所每週都會捲動出新的分類，
+    寫死代碼過一週就會失效，用 underlying_code 動態辨識才不會每週要改一次。"""
+    contracts = []
+    for cat in list(api.Contracts.Options):
+        try:
+            items = list(cat)
+        except Exception:
+            continue
+        if items and getattr(items[0], "underlying_code", None) == "IX0001":
+            contracts.extend(items)
+
+    future_dates = sorted(set(c.delivery_date for c in contracts if c.delivery_date >= today))
+    if not future_dates:
+        return None, {}, {}
+    nearest = future_dates[0]
+    chain = [c for c in contracts if c.delivery_date == nearest]
+    calls = {c.strike_price: c for c in chain if str(c.option_right).endswith("Call")}
+    puts = {c.strike_price: c for c in chain if str(c.option_right).endswith("Put")}
+    return nearest, calls, puts
+
+
+def quote_price(snap):
+    """優先用最新成交價；今天這檔還沒成交（close==0）就退而求其次用買賣報價中點；
+    兩邊都沒有（完全沒人掛單）就回傳 None，這個履約價不納入 PCP 平均。"""
+    if snap.close and snap.close > 0:
+        return snap.close
+    if snap.buy_price and snap.sell_price and snap.buy_price > 0 and snap.sell_price > 0:
+        return (snap.buy_price + snap.sell_price) / 2
+    return None
+
+
+def compute_intraday_pcp(api, calls, puts):
+    """跟 analyze_contract() 的 PCP 公式一樣：履約價 + 買權價 - 賣權價，取所有有效履約價的平均。
+    回傳 (隱含價或None, 有效履約價數量)。"""
+    strikes = sorted(set(calls) & set(puts))
+    if not strikes:
+        return None, 0
+    snap_contracts = [calls[k] for k in strikes] + [puts[k] for k in strikes]
+    snaps = api.snapshots(snap_contracts)
+    price_by_code = {s.code: quote_price(s) for s in snaps}
+    implied = []
+    for k in strikes:
+        cp = price_by_code.get(calls[k].code)
+        pp = price_by_code.get(puts[k].code)
+        if cp is not None and pp is not None:
+            implied.append(k + cp - pp)
+    if not implied:
+        return None, 0
+    return js_round(sum(implied) / len(implied)), len(implied)
+
+
+def update_html_intraday_pcp(value, contract_label, ts_str):
+    """更新網頁 header 上的「盤中隱含價」小卡片（intradayPcpVal / intradayPcpTime），
+    找不到標記或寫入失敗都只印警告，不影響主流程。"""
+    if not HTML_FILE.exists():
+        return
+    try:
+        html = HTML_FILE.read_text(encoding="utf-8")
+        html2 = re.sub(r'(<span id="intradayPcpVal">)[^<]*(</span>)',
+                        rf'\g<1>{value:.0f}（{contract_label}）\g<2>', html)
+        html2 = re.sub(r'(<span id="intradayPcpTime"[^>]*>)[^<]*(</span>)',
+                        rf'\g<1>{ts_str}\g<2>', html2)
+        if html2 == html:
+            print("（網頁同步：找不到 intradayPcpVal/intradayPcpTime 標記，略過盤中隱含價同步。）")
+            return
+        HTML_FILE.write_text(html2, encoding="utf-8")
+    except Exception as e:
+        print(f"（盤中隱含價網頁同步失敗，不影響紀錄本身：{e}）")
+
+
+def intraday_pcp_check():
+    if not SHIOAJI_CONFIG_FILE.exists():
+        print(f"（找不到 {SHIOAJI_CONFIG_FILE.name}，略過盤中PCP檢查。）")
+        return
+    try:
+        cfg = json.loads(SHIOAJI_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"（{SHIOAJI_CONFIG_FILE.name} 格式不對，略過盤中PCP檢查：{e}）")
+        return
+
+    import shioaji as sj
+    api = sj.Shioaji(simulation=False)
+    today = datetime.now()
+    try:
+        api.login(api_key=cfg["api_key"], secret_key=cfg["secret_key"])
+        time.sleep(5)  # 等合約表非同步載入完成
+        nearest, calls, puts = find_nearest_txo_chain(api, today.date())
+        if nearest is None:
+            print("目前抓不到任何臺指選擇權合約鏈，略過。")
+            return
+        value, n_strikes = compute_intraday_pcp(api, calls, puts)
+    finally:
+        try:
+            api.logout()
+        except Exception:
+            pass
+
+    if value is None:
+        print(f"{nearest} 這個契約目前沒有任何履約價同時有買權/賣權報價（可能非交易時段），略過。")
+        return
+
+    contract_label = nearest.strftime("%Y/%m/%d")
+    now_str = today.strftime("%Y/%m/%d %H:%M")
+
+    state = {}
+    if INTRADAY_STATE_FILE.exists():
+        try:
+            state = json.loads(INTRADAY_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+    prev_value = state.get("value") if state.get("contract") == contract_label else None
+    diff = (value - prev_value) if prev_value is not None else None
+
+    diff_note = f"，較上次 {diff:+.0f} 點" if diff is not None else "（本契約第一次記錄）"
+    print(f"[{now_str}] {contract_label} 契約盤中隱含價：{value}（{n_strikes} 檔履約價有效）{diff_note}")
+
+    update_html_intraday_pcp(value, contract_label, now_str)
+
+    INTRADAY_STATE_FILE.write_text(json.dumps(
+        {"contract": contract_label, "value": value, "ts": now_str}, ensure_ascii=False, indent=2
+    ), encoding="utf-8")
+
+    if diff is not None and abs(diff) >= INTRADAY_ALERT_THRESHOLD:
+        direction = "上漲" if diff > 0 else "下跌"
+        msg = (f"【TXO 盤中隱含價異動】{now_str}\n"
+               f"契約：{contract_label}\n"
+               f"隱含價從 {prev_value:.0f} {direction}到 {value:.0f}（變動 {diff:+.0f} 點，"
+               f"超過提醒門檻 {INTRADAY_ALERT_THRESHOLD} 點）\n"
+               f"（僅供盤中參考，不影響 Ensemble 權重計算——這個方法還沒有累積回測歷史）")
+        print(msg)
+        send_email(f"【TXO盤中隱含價異動】{direction}{abs(diff):.0f}點", msg)
+
+    git_commit_and_push(f"盤中PCP {now_str} {contract_label} {value}")
 
 
 def send_email(subject, body):
@@ -807,6 +961,8 @@ if __name__ == "__main__":
         predict_pm()
     elif mode == "closing":
         closing_report()
+    elif mode == "intraday_pcp":
+        intraday_pcp_check()
     else:
-        print("用法：python txo_automation.py [predict_am|predict_pm|closing]")
+        print("用法：python txo_automation.py [predict_am|predict_pm|closing|intraday_pcp]")
         sys.exit(1)

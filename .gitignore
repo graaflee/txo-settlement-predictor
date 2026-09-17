@@ -1,4 +1,7 @@
 __pycache__/
 *.pyc
 email_config.json
+shioaji_config.json
 pending_prediction.json
+intraday_pcp_state.json
+shioaji.log
