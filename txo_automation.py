@@ -25,6 +25,7 @@ import io
 import re
 import time
 import smtplib
+import shutil
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,12 +37,13 @@ EMAIL_CONFIG_FILE = PROJECT_DIR / "email_config.json"  # 不進 git（見 .gitig
 HTML_FILE = PROJECT_DIR / "TXO結算價預測 (1).html"
 SHIOAJI_CONFIG_FILE = PROJECT_DIR / "shioaji_config.json"  # 不進 git，裡面存永豐 API Key/Secret
 INTRADAY_STATE_FILE = PROJECT_DIR / "intraday_pcp_state.json"  # 不進 git，只是拿來跟上次比對用的暫存值
+DASHBOARD_URL = "https://graaflee.github.io/txo-settlement-predictor/"  # GitHub Pages，網頁以 index.html 發布
 INTRADAY_ALERT_THRESHOLD = 30  # 盤中隱含價比上次記錄變動超過這個點數才寄信提醒，避免每次排程都寄信
 
 # 另一個 Claude session 維護的券商信件情報資料庫（見該目錄的 README.md）。
 # 這批資料要靠 LLM 讀 Gmail/PDF 才能更新，不是本腳本能自動維護的，只負責讀取現有內容；
 # 讀不到檔案或當天沒資料都安靜略過，不影響本腳本主流程。
-BROKER_REPORTS_DIR = Path(r"C:\Users\A113010\Documents\Claude基本功\broker-reports")
+BROKER_REPORTS_DIR = Path.home() / "Documents" / "Claude基本功" / "broker-reports"
 BROKER_RELEVANT_KEYWORDS = ("大盤", "指數期貨", "選擇權")
 
 
@@ -335,7 +337,7 @@ def send_email(subject, body):
     msg["Subject"] = subject
     msg["From"] = from_email
     msg["To"] = to_email
-    msg.set_content(body)
+    msg.set_content(body + f"\n\nDashboard：{DASHBOARD_URL}")
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
@@ -353,7 +355,8 @@ def git_commit_and_push(message):
     之後任何 git 操作要動到這兩個檔案，都至少有紀錄可以救回來。
     這一步失敗（沒網路、git 沒設定等）只印警告，此時播報跟寄信都已經做完了，不影響主流程。"""
     try:
-        subprocess.run(["git", "add", "TXO結算價預測 (1).html", "backtest_history.json"],
+        shutil.copyfile(HTML_FILE, PROJECT_DIR / "index.html")
+        subprocess.run(["git", "add", "TXO結算價預測 (1).html", "index.html", "backtest_history.json"],
                         cwd=PROJECT_DIR, check=True, capture_output=True, text=True, encoding="utf-8")
         commit = subprocess.run(["git", "commit", "-m", message],
                                  cwd=PROJECT_DIR, capture_output=True, text=True, encoding="utf-8")
@@ -712,17 +715,17 @@ def generate_prediction_report(session_label, use_today_csv, save_pending):
         data = fetch_txo_csv(date_str)
         if not data:
             print(f"{date_str} 的盤後 CSV 尚未公布，稍後排程會再試一次，暫不播報。")
-            return
+            return False
     else:
         date_str, data = fetch_latest_csv(today)
         if not data:
             print("找不到最近的盤後 CSV，無法產生播報。")
-            return
+            return False
 
     contract, expiry_date = find_nearest_contract(data, today)
     if not contract:
         print(f"{date_str} 的 CSV 裡找不到任何尚未到期的契約，略過播報。")
-        return
+        return False
     is_settlement_today = expiry_date.date() == today.date()
 
     update_html_snapshot(data, date_str)
@@ -789,12 +792,13 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
         print("（今天是這個契約的結算日，已存下預測值供盤後結算比對）")
 
     git_commit_and_push(f"{session_label} {today.strftime('%Y/%m/%d')} {contract}")
+    return True
 
 
 def predict_am():
     """約 07:00 執行：盤後/夜盤收盤後的預測更新。save_pending=True——只有這個時段的執行
     會在結算日寫 pending_prediction.json 給 closing_report() 用。"""
-    generate_prediction_report("盤後收盤", use_today_csv=False, save_pending=True)
+    return generate_prediction_report("盤後收盤", use_today_csv=False, save_pending=True)
 
 
 def predict_pm():
@@ -804,7 +808,7 @@ def predict_pm():
     時間點重疊，可能出現「回測先消化掉早上那筆並刪除檔案，這裡的重試又重新寫一份新的，
     回測下一次重試又把它當成新資料再記一次」的重複記錄。只讓 predict_am() 寫這個檔案就
     不會有這個問題，predict_pm() 純粹是資訊性更新。"""
-    generate_prediction_report("早盤收盤", use_today_csv=True, save_pending=False)
+    return generate_prediction_report("早盤收盤", use_today_csv=True, save_pending=False)
 
 
 METHOD_NAMES = {"mp": "Max Pain", "pcp": "PCP隱含", "oi": "OI重心",
@@ -890,9 +894,10 @@ def closing_report(max_retries=1, retry_interval_sec=0):
         today_str = datetime.now().strftime("%Y/%m/%d")
         if any(r["date"] == today_str and r.get("actual") is not None for r in history):
             print(f"今天（{today_str}）的盤後結算已經記錄過了，不用重複執行。")
+            return True
         else:
             print("找不到今天的早盤預測紀錄（pending_prediction.json），無法產生盤後播報。請確認早盤播報有先執行過、且有 commit/push 回 repo。")
-        return
+        return False
 
     pending = json.loads(pending_file.read_text(encoding="utf-8"))
     contract = pending["contract"]
@@ -909,7 +914,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 
     if settle_price is None:
         print(f"今天（{contract}）的結算價目前還查不到，稍後排程會再試一次。如果到收盤後好幾個小時都還是這樣，可能要手動上台期所官網確認。")
-        return
+        return False
 
     pred = pending["pred"]
     errs = {k: (pred[k] - settle_price if pred.get(k) is not None else None) for k in ["mp", "pcp", "oi", "vw", "hb", "ns", "ens"]}
@@ -951,6 +956,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
     pending_file.unlink()
 
     git_commit_and_push(f"盤後結算 {record['date']} {contract} 實際{settle_price:.0f}")
+    return True
 
 
 if __name__ == "__main__":
