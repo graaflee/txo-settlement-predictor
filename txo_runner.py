@@ -15,7 +15,7 @@ import time
 import socket
 import subprocess
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -31,6 +31,10 @@ WINDOWS = {
     "pm": ((14, 0), (18, 0)),
     "closing": ((15, 0), (19, 0)),
 }
+
+
+# 台灣無日光節約，固定 UTC+8。電腦在國外或改了時區時，時間窗仍以台灣時間為準。
+TAIPEI = timezone(timedelta(hours=8))
 
 
 def due_jobs(now, state, pending_date):
@@ -102,7 +106,7 @@ def main():
     log("runner 啟動")
 
     while True:
-        now = datetime.now()
+        now = datetime.now(TAIPEI)
         state = load_state(now.strftime("%Y/%m/%d"))
         for name in due_jobs(now, state, read_pending_date()):
             if time.time() - last_try.get(name, 0) < RETRY_SEC:
