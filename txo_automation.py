@@ -265,22 +265,29 @@ def intraday_pcp_check():
         print(f"（{SHIOAJI_CONFIG_FILE.name} 格式不對，略過盤中PCP檢查：{e}）")
         return
 
-    import shioaji as sj
-    api = sj.Shioaji(simulation=False)
+    # 出差期間不呼叫 Shioaji（共用出差日曆 ~/.shioaji_shared/trips.json，與第一公式專案共用）；
+    # 同一時間只允許一個專案登入（跨程序鎖），避免兩邊互相逾時。守則模組載入失敗時寧可略過也不登入。
+    try:
+        from shioaji_guard import shioaji_session, TripModeError, LockTimeout
+    except ImportError as e:
+        print(f"（找不到 shioaji_guard，為避免違反出差規定，略過盤中PCP檢查：{e}）")
+        return
+
     today = datetime.now()
     try:
-        api.login(api_key=cfg["api_key"], secret_key=cfg["secret_key"])
-        time.sleep(5)  # 等合約表非同步載入完成
-        nearest, calls, puts = find_nearest_txo_chain(api, today.date())
-        if nearest is None:
-            print("目前抓不到任何臺指選擇權合約鏈，略過。")
-            return
-        value, n_strikes = compute_intraday_pcp(api, calls, puts)
-    finally:
-        try:
-            api.logout()
-        except Exception:
-            pass
+        with shioaji_session(cfg["api_key"], cfg["secret_key"]) as api:
+            time.sleep(5)  # 等合約表非同步載入完成
+            nearest, calls, puts = find_nearest_txo_chain(api, today.date())
+            if nearest is None:
+                print("目前抓不到任何臺指選擇權合約鏈，略過。")
+                return
+            value, n_strikes = compute_intraday_pcp(api, calls, puts)
+    except TripModeError as e:
+        print(f"（{e}，略過盤中PCP檢查。）")
+        return
+    except LockTimeout as e:
+        print(f"（{e}，這次略過，下次排程再試。）")
+        return
 
     if value is None:
         print(f"{nearest} 這個契約目前沒有任何履約價同時有買權/賣權報價（可能非交易時段），略過。")
