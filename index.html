@@ -797,10 +797,10 @@
   @media(max-width:900px){.acc-grid{grid-template-columns:repeat(2,1fr);}}
   .acc-card { background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:1rem 1.25rem;position:relative;overflow:hidden; }
   .acc-card::after { content:'';position:absolute;bottom:0;left:0;right:0;height:3px; }
-  .acc-card.m1::after{background:var(--amber)}.acc-card.m2::after{background:var(--green)}.acc-card.m3::after{background:var(--blue)}.acc-card.m4::after{background:var(--purple)}.acc-card.m5::after{background:var(--cyan)}.acc-card.m6::after{background:var(--lime)}.acc-card.m7::after{background:#c084fc}
+  .acc-card.m1::after{background:var(--amber)}.acc-card.m2::after{background:var(--green)}.acc-card.m3::after{background:var(--blue)}.acc-card.m4::after{background:var(--purple)}.acc-card.m5::after{background:var(--cyan)}.acc-card.m6::after{background:var(--lime)}.acc-card.m7::after{background:#c084fc}.acc-card.m8::after{background:#94a3b8}
   .acc-label { font-family:var(--mono);font-size:9px;color:var(--text2);letter-spacing:2px;margin-bottom:6px; }
   .acc-mae { font-family:var(--mono);font-size:24px;font-weight:bold; }
-  .acc-card.m1 .acc-mae{color:var(--amber)}.acc-card.m2 .acc-mae{color:var(--green)}.acc-card.m3 .acc-mae{color:var(--blue)}.acc-card.m4 .acc-mae{color:var(--purple)}.acc-card.m5 .acc-mae{color:var(--cyan)}.acc-card.m6 .acc-mae{color:var(--lime)}.acc-card.m7 .acc-mae{color:#c084fc}
+  .acc-card.m1 .acc-mae{color:var(--amber)}.acc-card.m2 .acc-mae{color:var(--green)}.acc-card.m3 .acc-mae{color:var(--blue)}.acc-card.m4 .acc-mae{color:var(--purple)}.acc-card.m5 .acc-mae{color:var(--cyan)}.acc-card.m6 .acc-mae{color:var(--lime)}.acc-card.m7 .acc-mae{color:#c084fc}.acc-card.m8 .acc-mae{color:#94a3b8}
   .acc-sub { font-size:10px;color:var(--text2);margin-top:3px;font-family:var(--mono); }
   .acc-rank { position:absolute;top:8px;right:10px;font-size:18px;opacity:0.7; }
   .acc-win { position:absolute;top:8px;right:10px;font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:10px; }
@@ -970,6 +970,7 @@
       <div class="ensemble-label">▶ ADAPTIVE ENSEMBLE 綜合預測</div>
       <div class="ensemble-price" id="ensemblePrice">—</div>
       <div class="ensemble-sub" id="ensembleSub">根據歷史回測自動調整權重</div>
+      <div class="ensemble-sub" id="baselineLine" style="display:none;color:#94a3b8"></div>
       <div class="ensemble-conf" id="ensembleConf">尚無回測資料，使用均等權重</div>
     </div>
     <div class="ensemble-weights" id="ensembleWeights">
@@ -1240,6 +1241,12 @@
         <div class="acc-mae" id="mae7">—</div>
         <div class="acc-sub" id="maeN7">無資料</div>
       </div>
+      <div class="acc-card m8">
+        <div class="acc-rank" id="rank8">—</div>
+        <div class="acc-label">簡單基準 MAE（台指期夜盤收盤）</div>
+        <div class="acc-mae" id="mae8">—</div>
+        <div class="acc-sub" id="maeN8">無資料</div>
+      </div>
     </div>
 
     <!-- Charts row -->
@@ -1343,6 +1350,7 @@
                 <th style="color:var(--cyan)">偏誤修正</th>
                 <th style="color:var(--lime)">夜盤隱含</th>
                 <th style="color:#c084fc">Ensemble</th>
+                <th style="color:#94a3b8">簡單基準</th>
                 <th>實際結算</th>
                 <th style="color:var(--amber)">MP誤差</th>
                 <th style="color:var(--green)">PCP誤差</th>
@@ -1351,6 +1359,7 @@
                 <th style="color:var(--cyan)">偏誤誤差</th>
                 <th style="color:var(--lime)">夜盤誤差</th>
                 <th style="color:#c084fc">ENS誤差</th>
+                <th style="color:#94a3b8">基準誤差</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -1402,7 +1411,8 @@ const RAW_DATA = {"202611W2": {"calls": {"35700": {"s": 0.0, "v": 0, "oi": 0, "b
 // ============================================================
 let currentContract = '202611';
 let NIGHT_IMPLIED = {};  // 第 6 種方法「夜盤隱含價」：{契約: 隱含價}，來自同一份 CSV 裡的'盤後'列
-const BAKED_BT_HISTORY = [{"date": "2026/08/26", "contract": "202608W4", "pred": {"mp": 44750, "pcp": 45021, "oi": 44638, "vw": 44496, "hb": null, "ns": 45313, "ens": 44726}, "actual": 45850.0}, {"date": "2026/08/28", "contract": "202608F4", "pred": {"mp": 45800, "pcp": 45982, "oi": 45595, "vw": 46074, "hb": null, "ns": 46295, "ens": 45949}, "actual": 46323.0}, {"date": "2026/09/02", "contract": "202609W1", "pred": {"mp": 46450, "pcp": 47085, "oi": 46197, "vw": 46554, "hb": 47262, "ns": 46709, "ens": 46664}, "actual": 46223.0}, {"date": "2026/09/04", "contract": "202609F1", "pred": {"mp": 46000, "pcp": 45790, "oi": 46177, "vw": 46145, "hb": 46465, "ns": 46278, "ens": 46143}, "actual": 46520.0}, {"date": "2026/09/09", "contract": "202609W2", "pred": {"mp": 46950, "pcp": 46979, "oi": 46763, "vw": 47200, "hb": 47429, "ns": 47051, "ens": 47066}, "actual": 47190.0}, {"date": "2026/09/11", "contract": "202609F2", "pred": {"mp": 46700, "pcp": 46868, "oi": 46790, "vw": 46810, "hb": 47131, "ns": 46232, "ens": 46702}, "actual": 46250.0}, {"date": "2026/09/16", "contract": "202609", "pred": {"mp": 45550, "pcp": 45600, "oi": 44681, "vw": 45797, "hb": 45834, "ns": 45527, "ens": 45507}, "actual": 45759.0, "backfilled": true}, {"date": "2026/09/18", "contract": "202609F3", "pred": {"mp": 46000, "pcp": 46278, "oi": 46082, "vw": 46424, "hb": 46274, "ns": 46902, "ens": 46419}, "actual": 47116.0, "backfilled": true}, {"date": "2026/09/23", "contract": "202609W4", "pred": {"mp": 47700, "pcp": 47978, "oi": 47407, "vw": 48185, "hb": 47984, "ns": 48162, "ens": 47949}, "actual": 48075.0}, {"date": "2026/09/29", "contract": "202609F4", "pred": {"mp": 47700, "pcp": 47907, "oi": 47600, "vw": 47799, "hb": 48078, "ns": 47803, "ens": 47823}, "actual": 47715.0, "backfilled": true}, {"date": "2026/09/30", "contract": "202609W5", "pred": {"mp": 47400, "pcp": 47550, "oi": 47374, "vw": 47719, "hb": 47742, "ns": 48161, "ens": 47758}, "actual": 48188.0, "backfilled": true}, {"date": "2026/10/02", "contract": "202610F1", "pred": {"mp": 47950, "pcp": 48380, "oi": 48090, "vw": 48183, "hb": 48261, "ns": 48145, "ens": 48165}, "actual": 48450.0, "backfilled": true}, {"date": "2026/10/07", "contract": "202610W1", "pred": {"mp": 49250, "pcp": 49787, "oi": 49163, "vw": 49665, "hb": 49559, "ns": 49827, "ens": 49610}, "actual": 49743.0, "backfilled": true}, {"date": "2026/10/12", "contract": "202610F2", "pred": {"mp": 49200, "pcp": 49151, "oi": 49443, "vw": 49424, "hb": 49581, "ns": 48601, "ens": 49105}, "actual": 49359.0, "backfilled": true}, {"date": "2026/10/14", "contract": "202610W2", "pred": {"mp": 48450, "pcp": 48190, "oi": 48649, "vw": 48439, "hb": 48795, "ns": 48528, "ens": 48493}, "actual": 48868.0, "backfilled": true}, {"date": "2026/10/16", "contract": "202610F3", "pred": {"mp": 47350, "pcp": 46809, "oi": 47733, "vw": 47306, "hb": 47647, "ns": 47053, "ens": 47272}, "actual": 47260.0}, {"date": "2026/10/21", "contract": "202610", "pred": {"mp": 46500, "pcp": 46351, "oi": 46825, "vw": 46584, "hb": 46898, "ns": 46813, "ens": 46668}, "actual": 46650.0}, {"date": "2026/10/28", "contract": "202610W4", "pred": {"mp": 45400, "pcp": 45771, "oi": 46182, "vw": 46075, "hb": 45792, "ns": 46515, "ens": 46010}, "actual": 46961.0}, {"date": "2026/10/30", "contract": "202610F5", "pred": {"mp": 46000, "pcp": 46240, "oi": 46404, "vw": 46506, "hb": 46437, "ns": 45849, "ens": 46237}, "actual": 45279.0}, {"date": "2026/11/04", "contract": "202611W1", "pred": {"mp": 44000, "pcp": 43149, "oi": 44485, "vw": 44004, "hb": 44327, "ns": 43541, "ens": 43893}, "actual": 42978.0}, {"date": "2026/11/06", "contract": "202611F1", "pred": {"mp": 41950, "pcp": 41698, "oi": 42722, "vw": 42469, "hb": 42174, "ns": 39620, "ens": 41591}, "actual": 39824.0}];
+const BAKED_BT_HISTORY = [{"date": "2026/08/26", "contract": "202608W4", "pred": {"mp": 44750, "pcp": 45021, "oi": 44638, "vw": 44496, "hb": null, "ns": 45313, "ens": 44726, "bn": 45437}, "actual": 45850.0}, {"date": "2026/08/28", "contract": "202608F4", "pred": {"mp": 45800, "pcp": 45982, "oi": 45595, "vw": 46074, "hb": null, "ns": 46295, "ens": 45949, "bn": 46388}, "actual": 46323.0}, {"date": "2026/09/02", "contract": "202609W1", "pred": {"mp": 46450, "pcp": 47085, "oi": 46197, "vw": 46554, "hb": 47262, "ns": 46709, "ens": 46664, "bn": 46679}, "actual": 46223.0}, {"date": "2026/09/04", "contract": "202609F1", "pred": {"mp": 46000, "pcp": 45790, "oi": 46177, "vw": 46145, "hb": 46465, "ns": 46278, "ens": 46143, "bn": 46487}, "actual": 46520.0}, {"date": "2026/09/09", "contract": "202609W2", "pred": {"mp": 46950, "pcp": 46979, "oi": 46763, "vw": 47200, "hb": 47429, "ns": 47051, "ens": 47066, "bn": 47055}, "actual": 47190.0}, {"date": "2026/09/11", "contract": "202609F2", "pred": {"mp": 46700, "pcp": 46868, "oi": 46790, "vw": 46810, "hb": 47131, "ns": 46232, "ens": 46702, "bn": 46072}, "actual": 46250.0}, {"date": "2026/09/16", "contract": "202609", "pred": {"mp": 45550, "pcp": 45600, "oi": 44681, "vw": 45797, "hb": 45834, "ns": 45527, "ens": 45507, "bn": 45529}, "actual": 45759.0, "backfilled": true}, {"date": "2026/09/18", "contract": "202609F3", "pred": {"mp": 46000, "pcp": 46278, "oi": 46082, "vw": 46424, "hb": 46274, "ns": 46902, "ens": 46419, "bn": 47160}, "actual": 47116.0, "backfilled": true}, {"date": "2026/09/23", "contract": "202609W4", "pred": {"mp": 47700, "pcp": 47978, "oi": 47407, "vw": 48185, "hb": 47984, "ns": 48162, "ens": 47949, "bn": 48497}, "actual": 48075.0}, {"date": "2026/09/29", "contract": "202609F4", "pred": {"mp": 47700, "pcp": 47907, "oi": 47600, "vw": 47799, "hb": 48078, "ns": 47803, "ens": 47823, "bn": 47956}, "actual": 47715.0, "backfilled": true}, {"date": "2026/09/30", "contract": "202609W5", "pred": {"mp": 47400, "pcp": 47550, "oi": 47374, "vw": 47719, "hb": 47742, "ns": 48161, "ens": 47758, "bn": 48479}, "actual": 48188.0, "backfilled": true}, {"date": "2026/10/02", "contract": "202610F1", "pred": {"mp": 47950, "pcp": 48380, "oi": 48090, "vw": 48183, "hb": 48261, "ns": 48145, "ens": 48165, "bn": 48475}, "actual": 48450.0, "backfilled": true}, {"date": "2026/10/07", "contract": "202610W1", "pred": {"mp": 49250, "pcp": 49787, "oi": 49163, "vw": 49665, "hb": 49559, "ns": 49827, "ens": 49610, "bn": 50051}, "actual": 49743.0, "backfilled": true}, {"date": "2026/10/12", "contract": "202610F2", "pred": {"mp": 49200, "pcp": 49151, "oi": 49443, "vw": 49424, "hb": 49581, "ns": 48601, "ens": 49105, "bn": 48705}, "actual": 49359.0, "backfilled": true}, {"date": "2026/10/14", "contract": "202610W2", "pred": {"mp": 48450, "pcp": 48190, "oi": 48649, "vw": 48439, "hb": 48795, "ns": 48528, "ens": 48493, "bn": 48755}, "actual": 48868.0, "backfilled": true}, {"date": "2026/10/16", "contract": "202610F3", "pred": {"mp": 47350, "pcp": 46809, "oi": 47733, "vw": 47306, "hb": 47647, "ns": 47053, "ens": 47272, "bn": 47366}, "actual": 47260.0}, {"date": "2026/10/21", "contract": "202610", "pred": {"mp": 46500, "pcp": 46351, "oi": 46825, "vw": 46584, "hb": 46898, "ns": 46813, "ens": 46668, "bn": 46975}, "actual": 46650.0}, {"date": "2026/10/28", "contract": "202610W4", "pred": {"mp": 45400, "pcp": 45771, "oi": 46182, "vw": 46075, "hb": 45792, "ns": 46515, "ens": 46010, "bn": 46880}, "actual": 46961.0}, {"date": "2026/10/30", "contract": "202610F5", "pred": {"mp": 46000, "pcp": 46240, "oi": 46404, "vw": 46506, "hb": 46437, "ns": 45849, "ens": 46237, "bn": 45926}, "actual": 45279.0}, {"date": "2026/11/04", "contract": "202611W1", "pred": {"mp": 44000, "pcp": 43149, "oi": 44485, "vw": 44004, "hb": 44327, "ns": 43541, "ens": 43893, "bn": 43779}, "actual": 42978.0}, {"date": "2026/11/06", "contract": "202611F1", "pred": {"mp": 41950, "pcp": 41698, "oi": 42722, "vw": 42469, "hb": 42174, "ns": 39620, "ens": 41591, "bn": 38936}, "actual": 39824.0}];
+const BASELINE_NOW = {"date": "2026/11/12", "value": 44606};
 let mpViewMode = 'focus';
 let oiViewMode = 'bar';
 let charts = {};
@@ -2264,6 +2274,17 @@ function updateEnsembleCard(contractKey) {
   document.getElementById('ensembleSub').textContent =
     `Max Pain ${mp?.toLocaleString()||'—'} · PCP ${pcp?.toLocaleString()||'—'} · OI重心 ${oi?.toLocaleString()||'—'} · 量加權 ${vw?.toLocaleString()||'—'} · 偏誤修正 ${hb?.toLocaleString()||'—'} · 夜盤 ${ns?.toLocaleString()||'—'}`;
 
+  // 簡單基準：台指期夜盤收盤（早盤就知道的最簡單預測，不依賴選擇權資料）。回測 370 個結算日顯示 Ensemble 並未贏過它。
+  const bl = document.getElementById('baselineLine');
+  if (BASELINE_NOW && BASELINE_NOW.value != null) {
+    const gap = ens != null ? ens - BASELINE_NOW.value : null;
+    bl.textContent = `簡單基準（${BASELINE_NOW.date} 台指期夜盤收盤）${BASELINE_NOW.value.toLocaleString()}` +
+      (gap != null ? ` · Ensemble ${gap >= 0 ? '+' : ''}${gap.toLocaleString()} 點` : '');
+    bl.style.display = '';
+  } else {
+    bl.style.display = 'none';
+  }
+
   const conf = document.getElementById('ensembleConf');
   if (weights.source === 'equal') {
     conf.textContent = '尚無足夠回測資料，使用均等權重 [各17%]';
@@ -2519,6 +2540,10 @@ function renderBacktest() {
     }
     maes.push(ensSum / done.length);
     counts.push(done.length);
+    // 簡單基準（台指期夜盤收盤，pred.bn）：不參與 Ensemble，只拿來當對照；有給過值的那幾筆才算
+    const bnErrs = done.filter(r => r.pred.bn != null).map(r => Math.abs(r.pred.bn - r.actual));
+    maes.push(bnErrs.length > 0 ? bnErrs.reduce((a,b)=>a+b,0)/bnErrs.length : null);
+    counts.push(bnErrs.length);
 
     const ranked = maes.map((mae,i) => ({ i, mae })).filter(x => x.mae != null);
     ranked.sort((a,b) => a.mae - b.mae);
@@ -2538,7 +2563,7 @@ function renderBacktest() {
       }
     }
   } else {
-    [1,2,3,4,5,6,7].forEach(i => {
+    [1,2,3,4,5,6,7,8].forEach(i => {
       document.getElementById('mae'+i).textContent = '—';
       document.getElementById('maeN'+i).textContent = '無回測資料';
       document.getElementById('rank'+i).textContent = '';
@@ -2569,7 +2594,7 @@ function renderBtTable(history, weights) {
   const tbody = document.getElementById('btTableBody');
   tbody.innerHTML = '';
   if (history.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="18" class="empty-state" style="padding:2rem"><div class="ei">📋</div>尚無回測記錄</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="20" class="empty-state" style="padding:2rem"><div class="ei">📋</div>尚無回測記錄</td></tr>';
     return;
   }
   [...history].reverse().forEach(r => {
@@ -2585,6 +2610,7 @@ function renderBtTable(history, weights) {
       ens != null ? ens - r.actual : null,
     ] : [null,null,null,null,null,null,null];
 
+    const bnErr = hasActual && r.pred.bn != null ? r.pred.bn - r.actual : null;
     function fmtErr(e) {
       if (e == null) return '<td>—</td>';
       const cls = errClass(e);
@@ -2604,11 +2630,12 @@ function renderBtTable(history, weights) {
       <td style="color:var(--cyan)">${r.pred.hb?.toLocaleString()||'—'}</td>
       <td style="color:var(--lime)">${r.pred.ns?.toLocaleString()||'—'}</td>
       <td style="color:#c084fc">${ens?.toLocaleString()||'—'}</td>
+      <td style="color:#94a3b8">${r.pred.bn?.toLocaleString()||'—'}</td>
       <td>${hasActual ? `<span style="color:var(--green);font-weight:bold">${r.actual.toLocaleString()}</span>` :
         `<input class="actual-input" placeholder="輸入結算" onkeydown="if(event.key==='Enter')saveActual(${r.id},this)">
          <button class="save-btn" style="margin-left:4px" onclick="saveActual(${r.id},this.previousElementSibling)">確認</button>`
       }</td>
-      ${fmtErr(errs[0])}${fmtErr(errs[1])}${fmtErr(errs[2])}${fmtErr(errs[3])}${fmtErr(errs[4])}${fmtErr(errs[5])}${fmtErr(errs[6])}
+      ${fmtErr(errs[0])}${fmtErr(errs[1])}${fmtErr(errs[2])}${fmtErr(errs[3])}${fmtErr(errs[4])}${fmtErr(errs[5])}${fmtErr(errs[6])}${fmtErr(bnErr)}
       <td><button class="del-btn" onclick="deleteRecord(${r.id})">✕</button></td>
     `;
     tbody.appendChild(tr);
@@ -2670,6 +2697,7 @@ function renderBtTrendChart(done) {
         { label:'量加權', data: done.map(r => r.pred.vw!=null?Math.abs(r.pred.vw-r.actual):null), borderColor:'#b388ff', backgroundColor:'transparent', borderWidth:2, pointRadius:4, tension:0.3 },
         { label:'偏誤修正', data: done.map(r => r.pred.hb!=null?Math.abs(r.pred.hb-r.actual):null), borderColor:'#4dd0e1', backgroundColor:'transparent', borderWidth:2, pointRadius:4, tension:0.3 },
         { label:'夜盤隱含', data: done.map(r => r.pred.ns!=null?Math.abs(r.pred.ns-r.actual):null), borderColor:'#a3e635', backgroundColor:'transparent', borderWidth:2, pointRadius:4, tension:0.3 },
+        { label:'簡單基準', data: done.map(r => r.pred.bn!=null?Math.abs(r.pred.bn-r.actual):null), borderColor:'#94a3b8', backgroundColor:'transparent', borderWidth:2, borderDash:[6,4], pointRadius:3, tension:0.3 },
       ]
     },
     options: {
@@ -3006,7 +3034,11 @@ function mergeBakedBtHistory() {
   let added = 0;
   for (const rec of BAKED_BT_HISTORY) {
     const key = `${rec.date}|${rec.contract}`;
-    if (existingKeys.has(key)) continue;
+    if (existingKeys.has(key)) {
+      const cur = history.find(r => `${r.date}|${r.contract}` === key);
+      if (cur && cur.pred && cur.pred.bn == null && rec.pred && rec.pred.bn != null) { cur.pred.bn = rec.pred.bn; added++; }
+      continue;
+    }
     history.push({ ...rec, id: rec.id || (Date.now() + added) });
     existingKeys.add(key);
     added++;

@@ -525,6 +525,62 @@ def fetch_night_session_implied(date_str):
     return result
 
 
+FUT_DATA_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
+
+
+def fetch_tx_night_close(date_str):
+    """「簡單基準」：指定日期(YYYY/MM/DD)台指期(TX)近月合約夜盤('盤後')收盤價，也就是前一晚 15:00 到當天 05:00 的最後一筆成交。
+    不需要選擇權資料、也不用 Shioaji，來源是台期所期貨盤後 CSV（跟選擇權 CSV 同一個下載端點家族，夜盤歸屬日規則相同）。
+    2026-11-12 歷史回補 370 個結算日顯示：Ensemble 的結算價預測誤差比這個基準大（MAE 277 vs 200 點），所以放在旁邊當對照。
+    近月 = 當天檔案裡最早到期的 6 位數月份契約（排除價差單等非單式契約）。查不到或夜盤無成交回傳 None。"""
+    raw = http_post(FUT_DATA_URL, {
+        "down_type": "1",
+        "commodity_id": "TX",
+        "commodity_id2": "",
+        "queryStartDate": date_str,
+        "queryEndDate": date_str,
+    })
+    rows = list(csv.reader(io.StringIO(raw.decode("big5", errors="ignore"))))
+    if len(rows) < 2:
+        return None
+    header = rows[0]
+    try:
+        i_month, i_close, i_sess = (header.index("到期月份(週別)"), header.index("收盤價"), header.index("交易時段"))
+    except ValueError:
+        return None
+    cands = []
+    for row in rows[1:]:
+        if len(row) <= max(i_month, i_close, i_sess) or row[i_sess].strip() != "盤後":
+            continue
+        month = row[i_month].strip()
+        if not (len(month) == 6 and month.isdigit()):
+            continue
+        try:
+            cands.append((month, float(row[i_close])))
+        except ValueError:
+            continue  # '-' 代表該契約夜盤沒成交
+    if not cands:
+        return None
+    cands.sort()
+    return cands[0][1]
+
+
+def update_html_baseline(value, date_str):
+    """把當下的簡單基準烘進網頁的 BASELINE_NOW（預測卡片顯示用）。找不到標記或寫入失敗只印警告。"""
+    if not HTML_FILE.exists():
+        return
+    try:
+        lines = HTML_FILE.read_text(encoding="utf-8").split("\n")
+        for i, line in enumerate(lines):
+            if line.startswith("const BASELINE_NOW = "):
+                lines[i] = "const BASELINE_NOW = " + json.dumps({"date": date_str, "value": value}, ensure_ascii=False) + ";"
+                HTML_FILE.write_text("\n".join(lines), encoding="utf-8")
+                return
+        print("（網頁同步：找不到 BASELINE_NOW 標記，略過簡單基準同步。）")
+    except Exception as e:
+        print(f"（簡單基準同步失敗，不影響預測本身：{e}）")
+
+
 def fetch_settlement_prices(year, month):
     """查詢台期所「臺指選擇權（TXO）最後結算價」表，回傳 {契約: 最後結算價}。
     這個表同時涵蓋週三(W系列)、週五(F系列，2025-06-27上市)、月選共 3 種結算契約，
@@ -751,6 +807,15 @@ def generate_prediction_report(session_label, use_today_csv, save_pending):
     ens = compute_ensemble(analysis["maxPainStrike"], analysis["impliedPrice"],
                             analysis["oiCenter"], analysis["volCenter"], hb, night_implied, weights)
 
+    # 簡單基準：台指期夜盤收盤（不納入 Ensemble，只當對照；抓不到不影響主流程）
+    baseline = None
+    try:
+        baseline = fetch_tx_night_close(today.strftime("%Y/%m/%d"))
+    except Exception as e:
+        print(f"（簡單基準（台指期夜盤收盤）抓取失敗，不影響預測：{e}）")
+    if baseline is not None:
+        update_html_baseline(js_round(baseline), today.strftime("%Y/%m/%d"))
+
     night_line = "（無夜盤資料可算隱含價，可能夜盤成交清淡）"
     if night_implied is not None and analysis["impliedPrice"] is not None:
         chg = night_implied - analysis["impliedPrice"]
@@ -772,6 +837,7 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
 - 成交量加權：{fmt_or_dash(analysis['volCenter'])}（權重 {weights['w4']*100:.0f}%）
 - 歷史偏誤修正：{fmt_or_dash(hb)}（權重 {weights['w5']*100:.0f}%）
 - 夜盤隱含價：{fmt_or_dash(night_implied)}（權重 {weights['w6']*100:.0f}%）{'　' + night_line if night_implied is not None else ''}
+- 簡單基準（台指期夜盤收盤，不納入 Ensemble）：{fmt_or_dash(js_round(baseline) if baseline is not None else None)}
 
 權重依據：{weights['source']}
 {broker_context}
@@ -791,6 +857,7 @@ Ensemble 綜合預測：{fmt_or_dash(ens)}
                 "hb": hb,
                 "ns": night_implied,
                 "ens": ens,
+                "bn": js_round(baseline) if baseline is not None else None,
             },
             "actual": None,
         }
@@ -924,7 +991,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
         return False
 
     pred = pending["pred"]
-    errs = {k: (pred[k] - settle_price if pred.get(k) is not None else None) for k in ["mp", "pcp", "oi", "vw", "hb", "ns", "ens"]}
+    errs = {k: (pred[k] - settle_price if pred.get(k) is not None else None) for k in ["mp", "pcp", "oi", "vw", "hb", "ns", "ens", "bn"]}
 
     history = load_history()
     record = {**pending, "actual": settle_price}
@@ -950,6 +1017,7 @@ def closing_report(max_retries=1, retry_interval_sec=0):
 - 歷史偏誤修正：{fmt(errs['hb'])}
 - 夜盤隱含價：{fmt(errs['ns'])}
 - Ensemble：{fmt(errs['ens'])}
+- 簡單基準（台指期夜盤收盤）：{fmt(errs['bn'])}
 
 更新後權重：MP {new_weights['w1']*100:.0f}% / PCP {new_weights['w2']*100:.0f}% / OI {new_weights['w3']*100:.0f}% / 量加權 {new_weights['w4']*100:.0f}% / 偏誤修正 {new_weights['w5']*100:.0f}% / 夜盤 {new_weights['w6']*100:.0f}%
 （{new_weights['source']}）
