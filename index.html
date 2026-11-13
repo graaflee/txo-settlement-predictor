@@ -840,6 +840,7 @@
   .disc-contract { font-family:var(--mono);font-size:12px;color:var(--amber); }
   .disc-date { font-family:var(--mono);font-size:10px;color:var(--text2); }
   .disc-actual { font-family:var(--mono);font-size:11px;color:var(--green); }
+  .disc-pred { font-family:var(--mono);font-size:11px;color:var(--amber); }
   .disc-row { display:flex;align-items:flex-start;gap:0.75rem;padding:6px 0;border-top:1px solid rgba(30,45,61,0.5);flex-wrap:wrap; }
   .disc-method { font-family:var(--mono);font-size:10px;width:75px;color:var(--text2);padding-top:2px; }
   .disc-err { font-family:var(--mono);font-size:12px;font-weight:bold;width:75px; }
@@ -2674,6 +2675,7 @@ function renderDiscrepancy(records) {
       <div class="disc-header">
         <span class="disc-contract">${r.contract}</span>
         <span class="disc-date">${r.date}</span>
+        ${r.pred && r.pred.ens != null ? `<span class="disc-pred">預測結算 ${Math.round(r.pred.ens).toLocaleString()}</span>` : ''}
         <span class="disc-actual">實際結算 ${r.actual?.toLocaleString()}</span>
       </div>
       ${rows}
